@@ -6,13 +6,12 @@ from lfx.log.logger import logger
 
 def tool_guard_validation(fc: List[Dict], messages: List[BaseMessage], tool_specs: List[Callable]) -> Dict:
     """ stub function of an example tool guard """
-    #print(f'function_call: {function_call}, tool_specs: {tool_specs}, messages: {messages}')
+    #print(f'function_call: {fc}, tool_specs: {tool_specs}, messages: {messages}')
 
     func = fc[0]['function']['name']
     args = fc[0]['function']['arguments']
 
     logger.info(f'🔒️ToolGuard invocation for {func}: {func+"_guard"}')
-    #print('in tool_guard_validation:', fc, messages, tool_specs)
 
     return evaluate_expression_guard(args)
 

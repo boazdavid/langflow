@@ -670,23 +670,8 @@ class ToolPipelineManager:
         wrapped_tool = tool
 
         for wrapper in reversed(self.wrappers):
-
             if wrapper.is_available:
-                if isinstance(wrapper, PreToolValidationWrapper):
-                    wrapped_kwargs = {**kwargs, "enable_validation": kwargs.get("enable_validation", True)}
-                    wrapped_tool = wrapper.wrap_tool(wrapped_tool, **wrapped_kwargs)
-                    # Ensure ValidatedTool has current tool specs
-                    if isinstance(wrapped_tool, ValidatedTool):
-                        wrapped_tool.tool_specs = wrapper.tool_specs
-                elif isinstance(wrapper, PreToolGuardWrapper):
-                    wrapped_kwargs = {**kwargs, "enable_tool_guard": kwargs.get("enable_tool_guard", False)}
-                    wrapped_tool = wrapper.wrap_tool(wrapped_tool, **wrapped_kwargs)
-                    # Ensure the guarded tool has current tool specs
-                    if isinstance(wrapped_tool, ProtectedTool):
-                        wrapped_tool.tool_specs = wrapper.tool_specs
-                else:
-                    wrapped_tool = wrapper.wrap_tool(wrapped_tool, **kwargs)
-
+                wrapped_tool = wrapper.wrap_tool(wrapped_tool, **kwargs)
         return wrapped_tool
 
 
