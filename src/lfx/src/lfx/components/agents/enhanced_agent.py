@@ -2,6 +2,8 @@
 Enhanced Agent Component that combines pre-tool validation and post-tool processing capabilities.
 """
 
+from dotenv import load_dotenv
+from pathlib import Path
 import json
 import os
 import uuid
@@ -376,6 +378,8 @@ class PreToolValidationWrapper(BaseToolWrapper):
         if not enable_validation:
             logger.info(f"Tool validation explicitly disabled for {tool.name}")
             return tool
+        else:
+            logger.info(f"Tool validation enabled for {tool.name}")
             
         if isinstance(tool, ValidatedTool):
             # Already wrapped, update context and tool specs
@@ -414,10 +418,6 @@ class PreToolValidationWrapper(BaseToolWrapper):
             return False
         
         try:
-            # Load .env file explicitly to ensure variables are available
-            from dotenv import load_dotenv
-            from pathlib import Path
-            
             # Try to load .env from project root
             env_path = Path(__file__).parents[6] / '.env'  # Navigate up to project root
             if env_path.exists():
@@ -686,7 +686,7 @@ class ToolPipelineManager:
                         wrapped_tool.tool_specs = wrapper.tool_specs
                 else:
                     wrapped_tool = wrapper.wrap_tool(wrapped_tool, **kwargs)
-        
+
         return wrapped_tool
 
 
@@ -1078,8 +1078,8 @@ class EnhancedAgentComponent(AgentComponent):
             agent=agent, 
             user_query=user_query,
             conversation_context=conversation_context,
-            enable_validation=getattr(self, "enable_tool_validation", True),
-            enable_tool_guard=getattr(self, "enable_tool_guard", False)
+            enable_validation=self.enable_tool_validation,
+            enable_tool_guard=self.enable_tool_guard,
         )
         
         # Set up the runnable agent
@@ -1146,8 +1146,7 @@ class EnhancedAgentComponent(AgentComponent):
             callbacks_to_be_used = [AgentAsyncHandler(self.log), *self.get_langchain_callbacks()]
             
             # Add validation callback if tool validation is enabled
-            if hasattr(self, "enable_tool_validation") and self.enable_tool_validation or \
-                    hasattr(self, "enable_tool_guard") and self.enable_tool_guard:
+            if self.enable_tool_validation or self.enable_tool_guard:
                 validation_handler = ToolValidationCallbackHandler()
                 callbacks_to_be_used.append(validation_handler)
 
