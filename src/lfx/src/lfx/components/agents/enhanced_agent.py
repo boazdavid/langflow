@@ -1,23 +1,23 @@
-"""
-Enhanced Agent Component that combines pre-tool validation and post-tool processing capabilities.
-"""
+"""Enhanced Agent Component that combines pre-tool validation and post-tool processing capabilities."""
 
-from dotenv import load_dotenv
-from pathlib import Path
+import ast
 import json
 import os
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, cast, Callable
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any, cast
 
-import ast
-from altk.post_tool_reflection_toolkit.code_generation.code_generation import (
+from altk.core.llm import get_llm
+from altk.core.toolkit import AgentPhase
+from altk.post_tool.code_generation.code_generation import (
     CodeGenerationComponent,
     CodeGenerationComponentConfig,
 )
-from altk.post_tool_reflection_toolkit.core.toolkit import CodeGenerationRunInput
+from altk.post_tool.core.toolkit import CodeGenerationRunInput
+from dotenv import load_dotenv
 from langchain.agents import AgentExecutor, BaseMultiActionAgent, BaseSingleActionAgent
-from langchain.callbacks.base import BaseCallbackHandler
 from langchain_anthropic.chat_models import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -28,12 +28,12 @@ from pydantic import Field
 
 from lfx.base.agents.callback import AgentAsyncHandler
 from lfx.base.agents.events import ExceptionWithMessageError, process_agent_events
-from lfx.base.agents.utils import data_to_messages
-from lfx.base.models.model_input_constants import MODEL_PROVIDERS_DICT
+from lfx.base.agents.utils import data_to_messages, get_chat_output_sender_name
+from lfx.base.models.model_input_constants import MODEL_PROVIDERS_DICT, MODELS_METADATA
 from lfx.components.agents import AgentComponent
 from lfx.components.helpers.memory import MemoryComponent
 from lfx.inputs.inputs import BoolInput
-from lfx.io import IntInput, Output, MultilineInput
+from lfx.io import DropdownInput, IntInput, MultilineInput, Output
 from lfx.log.logger import logger
 from lfx.memory import delete_message
 from lfx.schema.content_block import ContentBlock
@@ -41,13 +41,22 @@ from lfx.schema.data import Data
 from lfx.schema.message import Message
 from lfx.utils.constants import MESSAGE_SENDER_AI
 
-if TYPE_CHECKING:
-    pass
 
 def set_advanced_true(component_input):
     """Set the advanced flag to True for a component input."""
     component_input.advanced = True
     return component_input
+
+
+MODEL_PROVIDERS_LIST = ["Anthropic", "OpenAI"]
+INPUT_NAMES_TO_BE_OVERRIDDEN = ["agent_llm"]
+
+
+def get_parent_agent_inputs():
+    return [
+        input_field for input_field in AgentComponent.inputs if input_field.name not in INPUT_NAMES_TO_BE_OVERRIDDEN
+    ]
+
 
 # SPARC imports - use lazy loading to avoid module caching issues
 SPARCReflectionRunInput = None
@@ -58,41 +67,41 @@ SPARCReflectionComponent = None
 
 # === Base Tool Wrapper Architecture ===
 
+
 class BaseToolWrapper(ABC):
     """Base class for all tool wrappers in the pipeline.
-    
+
     Tool wrappers can enhance tools by adding pre-execution validation,
     post-execution processing, or other capabilities.
     """
-    
+
     @abstractmethod
     def wrap_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         """Wrap a tool with enhanced functionality.
-        
+
         Args:
             tool: The BaseTool to wrap
             **kwargs: Additional context for the wrapping operation
-            
+
         Returns:
             A wrapped BaseTool with enhanced functionality
         """
-        pass
-        
+
     def initialize(self, **kwargs) -> bool:
         """Initialize any resources needed by the wrapper.
-        
+
         Args:
             **kwargs: Configuration parameters for initialization
-            
+
         Returns:
             bool: True if initialization succeeded, False otherwise
         """
         return True
-        
+
     @property
     def is_available(self) -> bool:
         """Check if the wrapper is available for use.
-        
+
         Returns:
             bool: True if the wrapper can be used, False otherwise
         """
@@ -100,20 +109,21 @@ class BaseToolWrapper(ABC):
 
 
 class ValidatedTool(BaseTool):
-    """
-    A wrapper tool that validates calls before execution using SPARC reflection.
+    """A wrapper tool that validates calls before execution using SPARC reflection.
     Falls back to simple validation if SPARC is not available.
     """
-    
+
     name: str = Field(...)
     description: str = Field(...)
     wrapped_tool: BaseTool = Field(...)
-    sparc_component: Optional[Any] = Field(default=None)
-    conversation_context: List[BaseMessage] = Field(default_factory=list)
-    tool_specs: List[Dict] = Field(default_factory=list)
-    validation_attempts: Dict[str, int] = Field(default_factory=dict)
-    
-    def __init__(self, wrapped_tool: BaseTool, sparc_component=None, conversation_context=None, tool_specs=None, **kwargs):
+    sparc_component: Any | None = Field(default=None)
+    conversation_context: list[BaseMessage] = Field(default_factory=list)
+    tool_specs: list[dict] = Field(default_factory=list)
+    validation_attempts: dict[str, int] = Field(default_factory=dict)
+
+    def __init__(
+        self, wrapped_tool: BaseTool, sparc_component=None, conversation_context=None, tool_specs=None, **kwargs
+    ):
         super().__init__(
             name=wrapped_tool.name,
             description=wrapped_tool.description,
@@ -121,17 +131,17 @@ class ValidatedTool(BaseTool):
             sparc_component=sparc_component,
             conversation_context=conversation_context or [],
             tool_specs=tool_specs or [],
-            **kwargs
+            **kwargs,
         )
-    
+
     def _run(self, *args, **kwargs) -> str:
         """Execute the tool with validation."""
         return self._validate_and_run(*args, **kwargs)
-    
+
     async def _arun(self, *args, **kwargs) -> str:
         """Async execute the tool with validation."""
         return self._validate_and_run(*args, **kwargs)
-    
+
     def _validate_and_run(self, *args, **kwargs) -> str:
         """Validate the tool call using SPARC and execute if valid."""
         # Check if validation should be bypassed
@@ -139,56 +149,50 @@ class ValidatedTool(BaseTool):
             if kwargs.get("bypass_validation", False):
                 kwargs.pop("bypass_validation", None)
             return self._execute_tool(*args, **kwargs)
-        
+
         # Prepare tool call for SPARC validation
         tool_call = {
             "id": str(uuid.uuid4()),
             "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": json.dumps(self._prepare_arguments(*args, **kwargs))
-            }
+            "function": {"name": self.name, "arguments": json.dumps(self._prepare_arguments(*args, **kwargs))},
         }
-        
+
         try:
             # Run SPARC validation
             run_input = SPARCReflectionRunInput(
-                messages=self.conversation_context,
-                tool_specs=self.tool_specs,
-                tool_calls=[tool_call]
+                messages=self.conversation_context, tool_specs=self.tool_specs, tool_calls=[tool_call]
             )
-            
+
             # Check for missing tool specs and bypass if necessary
             if not self.tool_specs:
                 logger.warning(f"No tool specs available for SPARC validation of {self.name}, executing directly")
                 return self._execute_tool(*args, **kwargs)
-            
+
             result = self.sparc_component.process(run_input, phase=AgentPhase.RUNTIME)
-            
+
             # Check validation result
             if result.output.reflection_result.decision.name == "APPROVE":
                 logger.info(f"✅ SPARC approved tool call for {self.name}")
                 return self._execute_tool(*args, **kwargs)
-            else:
-                logger.info(f"❌ SPARC rejected tool call for {self.name}")
-                error_msg = self._format_sparc_rejection(result.output.reflection_result)
-                return error_msg
-                
+            logger.info(f"❌ SPARC rejected tool call for {self.name}")
+            error_msg = self._format_sparc_rejection(result.output.reflection_result)
+            return error_msg
+
         except Exception as e:
             logger.error(f"Error during SPARC validation: {e}")
             # Execute directly on error
             return self._execute_tool(*args, **kwargs)
-    
-    def _prepare_arguments(self, *args, **kwargs) -> Dict[str, Any]:
+
+    def _prepare_arguments(self, *args, **kwargs) -> dict[str, Any]:
         """Prepare arguments for SPARC validation."""
         # Remove config parameter if present (not needed for validation)
-        clean_kwargs = {k: v for k, v in kwargs.items() if k != 'config'}
-        
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != "config"}
+
         # If we have positional args, try to map them to parameter names
-        if args and hasattr(self.wrapped_tool, 'args_schema'):
+        if args and hasattr(self.wrapped_tool, "args_schema"):
             try:
                 schema = self.wrapped_tool.args_schema
-                if hasattr(schema, '__fields__'):
+                if hasattr(schema, "__fields__"):
                     field_names = list(schema.__fields__.keys())
                     for i, arg in enumerate(args):
                         if i < len(field_names):
@@ -196,64 +200,60 @@ class ValidatedTool(BaseTool):
             except Exception:
                 # If schema parsing fails, just use kwargs
                 pass
-        
+
         return clean_kwargs
-    
+
     def _format_sparc_rejection(self, reflection_result) -> str:
         """Format SPARC rejection into a helpful error message."""
         if not reflection_result.issues:
             return "Error: Tool call validation failed - please review your approach and try again"
-        
+
         error_parts = ["Tool call validation failed:"]
-        
+
         for issue in reflection_result.issues:
             error_parts.append(f"\n• {issue.explanation}")
             if issue.correction:
                 try:
                     correction_data = issue.correction
                     if isinstance(correction_data, dict):
-                        if 'corrected_function_name' in correction_data:
+                        if "corrected_function_name" in correction_data:
                             error_parts.append(f"  💡 Suggested function: {correction_data['corrected_function_name']}")
-                        elif 'tool_call' in correction_data:
-                            suggested_args = correction_data['tool_call'].get('arguments', {})
+                        elif "tool_call" in correction_data:
+                            suggested_args = correction_data["tool_call"].get("arguments", {})
                             error_parts.append(f"  💡 Suggested parameters: {suggested_args}")
                 except Exception:
                     # If correction parsing fails, skip it
                     pass
-        
+
         error_parts.append("\nPlease adjust your approach and try again.")
         return "\n".join(error_parts)
-    
+
     def _execute_tool(self, *args, **kwargs) -> str:
         """Execute the wrapped tool with proper error handling."""
         try:
             # Try with config parameter first (newer LangChain versions)
-            if hasattr(self.wrapped_tool, '_run'):
+            if hasattr(self.wrapped_tool, "_run"):
                 # Ensure config is provided for StructuredTool
-                if 'config' not in kwargs:
-                    kwargs['config'] = {}
+                if "config" not in kwargs:
+                    kwargs["config"] = {}
                 return self.wrapped_tool._run(*args, **kwargs)
-            else:
-                return self.wrapped_tool.run(*args, **kwargs)
+            return self.wrapped_tool.run(*args, **kwargs)
         except TypeError as e:
             if "config" in str(e):
                 # Fallback: try without config for older tools
-                kwargs.pop('config', None)
-                if hasattr(self.wrapped_tool, '_run'):
+                kwargs.pop("config", None)
+                if hasattr(self.wrapped_tool, "_run"):
                     return self.wrapped_tool._run(*args, **kwargs)
-                else:
-                    return self.wrapped_tool.run(*args, **kwargs)
-            else:
-                raise e
-    
-    def update_context(self, conversation_context: List[BaseMessage]):
+                return self.wrapped_tool.run(*args, **kwargs)
+            raise e
+
+    def update_context(self, conversation_context: list[BaseMessage]):
         """Update the conversation context."""
         self.conversation_context = conversation_context
 
 
 class ProtectedTool(BaseTool):
-    """
-    A wrapper tool that validates calls before execution using ToolGuard component.
+    """A wrapper tool that validates calls before execution using ToolGuard component.
     Falls back to simple validation if ToolGuard is not available.
 
     """
@@ -261,11 +261,13 @@ class ProtectedTool(BaseTool):
     name: str = Field(...)
     description: str = Field(...)
     wrapped_tool: BaseTool = Field(...)
-    toolguard_component: Optional[Any] = Field(default=None)
-    conversation_context: List[BaseMessage] = Field(default_factory=list)
-    tool_specs: List[Callable] = Field(default_factory=list)
+    toolguard_component: Any | None = Field(default=None)
+    conversation_context: list[BaseMessage] = Field(default_factory=list)
+    tool_specs: list[Callable] = Field(default_factory=list)
 
-    def __init__(self, wrapped_tool: BaseTool, toolguard_component=None, conversation_context=None, tool_specs=None, **kwargs):
+    def __init__(
+        self, wrapped_tool: BaseTool, toolguard_component=None, conversation_context=None, tool_specs=None, **kwargs
+    ):
         super().__init__(
             name=wrapped_tool.name,
             description=wrapped_tool.description,
@@ -273,9 +275,9 @@ class ProtectedTool(BaseTool):
             toolguard_component=toolguard_component,
             conversation_context=conversation_context or [],
             tool_specs=tool_specs or [],
-            **kwargs
+            **kwargs,
         )
-        logger.info(f'🔒️ToolGuard processor initialized for {self.name}')
+        logger.info(f"🔒️ToolGuard processor initialized for {self.name}")
 
     def _run(self, *args, **kwargs) -> str:
         """Execute the tool with validation."""
@@ -287,89 +289,81 @@ class ProtectedTool(BaseTool):
 
     def _validate_and_run(self, *args, **kwargs) -> str:
         """Validate the tool call using ToolGuard and execute if valid."""
-
         tool_guard_arguments = {
-            "function": {
-                "name": self.name,
-                "arguments": json.dumps(self._prepare_arguments(*args, **kwargs))
-            }
+            "function": {"name": self.name, "arguments": json.dumps(self._prepare_arguments(*args, **kwargs))}
         }
 
         try:
             from lfx.components.agents.tool_guards.tool_guard import tool_guard_validation
+
             result = tool_guard_validation(
                 fc=[tool_guard_arguments],
                 messages=self.conversation_context,
                 tool_specs=self.tool_specs,
             )
 
-            if result['valid']:  # tool guard returned Ok
+            if result["valid"]:  # tool guard returned Ok
                 logger.info(f"✅ ToolGuard evaluated and approved running {self.name}")
                 return self._execute_tool(*args, **kwargs)
-            else:
-                logger.info(f"❌ ToolGuard evaluated and rejected running {self.name}")
-                error_msg = result['error_msg']
-                return error_msg
+            logger.info(f"❌ ToolGuard evaluated and rejected running {self.name}")
+            error_msg = result["error_msg"]
+            return error_msg
 
         except Exception as e:
             logger.error(f"🔒️ToolGuard: error during validation: {e}")
             # execute directly on error (no fallback validation)
             return self._execute_tool(*args, **kwargs)
 
-    def _prepare_arguments(self, *args, **kwargs) -> Dict[str, Any]:
+    def _prepare_arguments(self, *args, **kwargs) -> dict[str, Any]:
         """..."""
         # remove config parameter if present (not needed for validation)
-        clean_kwargs = {k: v for k, v in kwargs.items() if k != 'config'}
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != "config"}
         return clean_kwargs
 
     def _execute_tool(self, *args, **kwargs) -> str:
         """Execute the wrapped tool with proper error handling."""
-
         try:
             # try with config parameter first (newer LangChain versions)
-            if hasattr(self.wrapped_tool, '_run'):
+            if hasattr(self.wrapped_tool, "_run"):
                 # ensure config is provided for StructuredTool
-                if 'config' not in kwargs:
-                    kwargs['config'] = {}
+                if "config" not in kwargs:
+                    kwargs["config"] = {}
                 return self.wrapped_tool._run(*args, **kwargs)
-            else:
-                return self.wrapped_tool.run(*args, **kwargs)
+            return self.wrapped_tool.run(*args, **kwargs)
         except TypeError as e:
             if "config" in str(e):
                 # fallback: try without config for older tools
-                kwargs.pop('config', None)
-                if hasattr(self.wrapped_tool, '_run'):
+                kwargs.pop("config", None)
+                if hasattr(self.wrapped_tool, "_run"):
                     return self.wrapped_tool._run(*args, **kwargs)
-                else:
-                    return self.wrapped_tool.run(*args, **kwargs)
-            else:
-                raise e
+                return self.wrapped_tool.run(*args, **kwargs)
+            raise e
 
-    def update_context(self, conversation_context: List[BaseMessage]):
+    def update_context(self, conversation_context: list[BaseMessage]):
         """Update the conversation context."""
         self.conversation_context = conversation_context
 
 
 class PreToolValidationWrapper(BaseToolWrapper):
     """Tool wrapper that adds pre-tool validation capabilities.
-    
+
     This wrapper validates tool calls before execution using the SPARC
     reflection component to check for appropriateness and correctness.
     """
-    
+
     def __init__(self):
         self.sparc_component = None
         self.tool_specs = []
         self.available = self._initialize_sparc_component()
-        
+
     def wrap_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         """Wrap a tool with validation functionality.
-        
+
         Args:
             tool: The BaseTool to wrap
             **kwargs: May contain 'conversation_context' for improved validation
                       and 'enable_validation' to determine if validation should be applied
-            
+
         Returns:
             A wrapped BaseTool with validation capabilities
         """
@@ -378,9 +372,8 @@ class PreToolValidationWrapper(BaseToolWrapper):
         if not enable_validation:
             logger.info(f"Tool validation explicitly disabled for {tool.name}")
             return tool
-        else:
-            logger.info(f"Tool validation enabled for {tool.name}")
-            
+        logger.info(f"Tool validation enabled for {tool.name}")
+
         if isinstance(tool, ValidatedTool):
             # Already wrapped, update context and tool specs
             tool.sparc_component = self.sparc_component
@@ -389,62 +382,62 @@ class PreToolValidationWrapper(BaseToolWrapper):
                 tool.update_context(kwargs["conversation_context"])
             logger.debug(f"Updated existing ValidatedTool {tool.name} with {len(self.tool_specs)} tool specs")
             return tool
-            
+
         # Wrap with validation
         validated_tool = ValidatedTool(
             wrapped_tool=tool,
             sparc_component=self.sparc_component,
             tool_specs=self.tool_specs,
-            conversation_context=kwargs.get("conversation_context", [])
+            conversation_context=kwargs.get("conversation_context", []),
         )
-        
+
         if self.sparc_component:
             logger.info(f"Wrapped tool '{tool.name}' with SPARC validation ({len(self.tool_specs)} tool specs)")
         else:
             logger.info(f"Wrapped tool '{tool.name}' with fallback validation")
-            
+
         return validated_tool
-        
+
     @property
     def is_available(self) -> bool:
         """Check if the SPARC component is available."""
         return self.available
-        
+
     def _initialize_sparc_component(self) -> bool:
         """Initialize the SPARC reflection component if available."""
         # Use lazy loading to check SPARC availability
         if not _check_sparc_available():
             logger.warning("SPARC toolkit not available - tool validation will be disabled")
             return False
-        
+
         try:
             # Try to load .env from project root
-            env_path = Path(__file__).parents[6] / '.env'  # Navigate up to project root
+            env_path = Path(__file__).parents[6] / ".env"  # Navigate up to project root
             if env_path.exists():
                 load_dotenv(env_path)
                 logger.debug(f"Loaded .env from {env_path}")
             else:
                 load_dotenv()  # Try default locations
                 logger.debug("Loaded .env from default location")
-            
+
             logger.info("Initializing SPARC reflection component...")
-            
+
             # Check if required environment variables are available
             api_key = os.getenv("WX_API_KEY")
             project_id = os.getenv("WX_PROJECT_ID")
             url = os.getenv("WX_URL", "https://us-south.ml.cloud.ibm.com")
-            
+
             if not api_key or not project_id:
                 logger.warning("WatsonX credentials not found in environment - SPARC validation will be disabled")
                 logger.info("Set WX_API_KEY and WX_PROJECT_ID environment variables to enable SPARC")
                 return False
-            
+
             logger.info(f"Using WatsonX URL: {url}")
             logger.info(f"Using project ID: {project_id[:8]}...")
-            
+
             # Build ComponentConfig with WatsonX ValidatingLLMClient
             WATSONX_CLIENT = get_llm("watsonx.output_val")
-            
+
             config = ComponentConfig(
                 llm_client=WATSONX_CLIENT(
                     model_id="meta-llama/llama-4-maverick-17b-128e-instruct-fp8",
@@ -453,97 +446,92 @@ class PreToolValidationWrapper(BaseToolWrapper):
                     url=url,
                 )
             )
-            
+
             self.sparc_component = SPARCReflectionComponent(
                 config=config,
                 track=Track.FAST_TRACK,  # Use fast track for performance
                 execution_mode=SPARCExecutionMode.SYNC,  # Use SYNC to avoid event loop conflicts
             )
-            
-            if hasattr(self.sparc_component, '_initialization_error') and self.sparc_component._initialization_error:
+
+            if hasattr(self.sparc_component, "_initialization_error") and self.sparc_component._initialization_error:
                 logger.error(f"SPARC component has initialization error: {self.sparc_component._initialization_error}")
                 return False
-            else:
-                logger.info("✅ SPARC reflection component initialized successfully")
-                return True
-                
+            logger.info("✅ SPARC reflection component initialized successfully")
+            return True
+
         except Exception as e:
             logger.error(f"Error initializing SPARC component: {e}")
             logger.exception("Full traceback:")
             return False
-    
+
     @staticmethod
-    def convert_langchain_tools_to_sparc_tool_specs_format(tools: List[BaseTool]) -> List[Dict]:
+    def convert_langchain_tools_to_sparc_tool_specs_format(tools: list[BaseTool]) -> list[dict]:
         """Convert LangChain tools to SPARC tool specifications."""
         tool_specs = []
-        
+
         for i, tool in enumerate(tools):
             try:
                 # Handle nested wrappers
                 unwrapped_tool = tool
                 wrapper_count = 0
-                
+
                 # Unwrap to get to the actual tool
                 while hasattr(unwrapped_tool, "wrapped_tool") and not isinstance(unwrapped_tool, ValidatedTool):
                     unwrapped_tool = unwrapped_tool.wrapped_tool
                     wrapper_count += 1
                     if wrapper_count > 10:  # Prevent infinite loops
                         break
-                
+
                 # Build tool spec from LangChain tool
                 tool_spec = {
                     "type": "function",
                     "function": {
                         "name": unwrapped_tool.name,
                         "description": unwrapped_tool.description or f"Tool: {unwrapped_tool.name}",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }
-                    }
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
                 }
-                
+
                 # Extract parameters from tool schema if available
-                if hasattr(unwrapped_tool, 'args_schema') and unwrapped_tool.args_schema:
+                if hasattr(unwrapped_tool, "args_schema") and unwrapped_tool.args_schema:
                     schema = unwrapped_tool.args_schema
-                    if hasattr(schema, '__fields__'):
+                    if hasattr(schema, "__fields__"):
                         for field_name, field_info in schema.__fields__.items():
                             param_spec = {
                                 "type": "string",  # Default type
-                                "description": getattr(field_info, 'description', f"Parameter {field_name}")
+                                "description": getattr(field_info, "description", f"Parameter {field_name}"),
                             }
-                            
+
                             # Try to infer type from field info
-                            if hasattr(field_info, 'type_'):
+                            if hasattr(field_info, "type_"):
                                 if field_info.type_ == int:
                                     param_spec["type"] = "integer"
                                 elif field_info.type_ == float:
                                     param_spec["type"] = "number"
                                 elif field_info.type_ == bool:
                                     param_spec["type"] = "boolean"
-                            
+
                             tool_spec["function"]["parameters"]["properties"][field_name] = param_spec
-                            
+
                             # Check if field is required
-                            if hasattr(field_info, 'is_required') and field_info.is_required():
+                            if hasattr(field_info, "is_required") and field_info.is_required():
                                 tool_spec["function"]["parameters"]["required"].append(field_name)
-                
+
                 tool_specs.append(tool_spec)
-                
+
             except Exception as e:
                 logger.warning(f"Could not convert tool {getattr(tool, 'name', 'unknown')} to spec: {e}")
                 # Create minimal spec
                 minimal_spec = {
                     "type": "function",
                     "function": {
-                        "name": getattr(tool, 'name', f'unknown_tool_{i}'),
-                        "description": getattr(tool, 'description', f"Tool: {getattr(tool, 'name', 'unknown')}"),
-                        "parameters": {"type": "object", "properties": {}, "required": []}
-                    }
+                        "name": getattr(tool, "name", f"unknown_tool_{i}"),
+                        "description": getattr(tool, "description", f"Tool: {getattr(tool, 'name', 'unknown')}"),
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
                 }
                 tool_specs.append(minimal_spec)
-        
+
         if not tool_specs:
             logger.error("⚠️ No tool specs were generated! This will cause SPARC validation to fail")
         return tool_specs
@@ -593,7 +581,7 @@ class PreToolGuardWrapper(BaseToolWrapper):
             wrapped_tool=tool,
             tool_guard_component=self.tool_guard_component,
             tool_specs=self.tool_specs,
-            conversation_context=kwargs.get("conversation_context", [])
+            conversation_context=kwargs.get("conversation_context", []),
         )
 
         if self.tool_guard_component:
@@ -610,50 +598,49 @@ class PreToolGuardWrapper(BaseToolWrapper):
 
     def _initialize_tool_guard_component(self) -> bool:
         """Initialize the tool guard component if available."""
-
-        #todo: implement this function when ToolGuard is available on altk
-        logger.info('🔒️ToolGuard mock implementation initialized successfully')
+        # TODO: implement this function when ToolGuard is available on altk
+        logger.info("🔒️ToolGuard mock implementation initialized successfully")
         return True
 
 
 class ToolPipelineManager:
     """Manages the tool wrapping pipeline.
-    
+
     The pipeline can contain multiple wrappers that are applied
     in sequence to transform or enhance tools. The wrappers are
     applied in reverse order so the first wrapper is the outermost
     wrapper and the last wrapper is the innermost wrapper.
     """
-    
+
     def __init__(self):
-        self.wrappers: List[BaseToolWrapper] = []
-        
+        self.wrappers: list[BaseToolWrapper] = []
+
     @property
     def has_wrappers(self) -> bool:
         """Check if any wrappers are registered.
-        
+
         Returns:
             bool: True if wrappers are available, False otherwise
         """
         return len(self.wrappers) > 0
-        
+
     def add_wrapper(self, wrapper: BaseToolWrapper):
         """Add a wrapper to the pipeline.
-        
+
         Args:
             wrapper: A BaseToolWrapper implementation to add to the pipeline
         """
         self.wrappers.append(wrapper)
-        
-    def process_tools(self, tools: List[BaseTool], **kwargs) -> List[BaseTool]:
+
+    def process_tools(self, tools: list[BaseTool], **kwargs) -> list[BaseTool]:
         """Apply all wrappers to the tools in reverse order of registration."""
         # Update tool specs for validation wrappers
         self._update_validation_tool_specs(tools)
-        
+
         # Apply wrappers to each tool
         return [self._apply_wrappers_to_tool(tool, **kwargs) for tool in tools]
-    
-    def _update_validation_tool_specs(self, tools: List[BaseTool]) -> None:
+
+    def _update_validation_tool_specs(self, tools: list[BaseTool]) -> None:
         """Update tool specs for validation wrappers with the actual tools."""
         for wrapper in self.wrappers:
             if isinstance(wrapper, PreToolValidationWrapper) and tools:
@@ -661,8 +648,8 @@ class ToolPipelineManager:
                 logger.info(f"Updated tool specs for validation: {len(wrapper.tool_specs)} tools")
             elif isinstance(wrapper, PreToolGuardWrapper) and tools:
                 wrapper.tool_specs = tools
-                #if willing to have a list of json-like tool definitions
-                #wrapper.tool_specs = PreToolValidationWrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
+                # if willing to have a list of json-like tool definitions
+                # wrapper.tool_specs = PreToolValidationWrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
                 logger.info(f"🔒️Updated tool specs for tool guard execution: {len(wrapper.tool_specs)} tools")
 
     def _apply_wrappers_to_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
@@ -676,6 +663,7 @@ class ToolPipelineManager:
 
 
 # === Post Tool Processing Implementation ===
+
 
 class PostToolProcessor(BaseTool):
     """A tool output processor to process tool outputs.
@@ -735,10 +723,10 @@ class PostToolProcessor(BaseTool):
             # If post-processing fails, log the error and return the original result
             logger.error(f"Error in post-processing tool response: {e}")
             return result
-        
-    async def _arun(self, *args: Any, **kwargs: Any) -> str:
-        # Run the wrapped tool synchronously for now (can be enhanced for async later)
-        return self._run(*args, **kwargs)
+
+    # async def _arun(self, *args: Any, **kwargs: Any) -> str:
+    #     # Run the wrapped tool synchronously for now (can be enhanced for async later)
+    #     return self._run(*args, **kwargs)
 
     def _get_tool_response_str(self, tool_response) -> str:
         """Convert various tool response formats to a string representation."""
@@ -754,7 +742,7 @@ class PostToolProcessor(BaseTool):
         else:
             # Return empty string instead of None to avoid type errors
             tool_response_str = str(tool_response) if tool_response is not None else ""
-        
+
         return tool_response_str
 
     def _get_altk_llm_object(self) -> Any:
@@ -794,8 +782,9 @@ class PostToolProcessor(BaseTool):
 
         try:
             # Only attempt to parse content that looks like JSON
-            if (tool_response_str.startswith("{") and tool_response_str.endswith("}")) or \
-               (tool_response_str.startswith("[") and tool_response_str.endswith("]")):
+            if (tool_response_str.startswith("{") and tool_response_str.endswith("}")) or (
+                tool_response_str.startswith("[") and tool_response_str.endswith("]")
+            ):
                 tool_response_json = ast.literal_eval(tool_response_str)
                 if not isinstance(tool_response_json, (list, dict)):
                     tool_response_json = None
@@ -828,39 +817,39 @@ class PostToolProcessor(BaseTool):
 
 class PostToolProcessingWrapper(BaseToolWrapper):
     """Tool wrapper that adds post-tool processing capabilities.
-    
+
     This wrapper processes the output of tool calls, particularly JSON responses,
     using the ALTK code generation component to extract useful information.
     """
-    
+
     def __init__(self, response_processing_size_threshold: int = 100):
         self.response_processing_size_threshold = response_processing_size_threshold
-        
+
     def wrap_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         """Wrap a tool with post-processing functionality.
-        
+
         Args:
             tool: The BaseTool to wrap
             **kwargs: Must contain 'agent' and 'user_query'
-            
+
         Returns:
             A wrapped BaseTool with post-processing capabilities
         """
         if isinstance(tool, PostToolProcessor):
             # Already wrapped with this wrapper, just return it
             return tool
-            
+
         # Required kwargs
         agent = kwargs.get("agent")
         user_query = kwargs.get("user_query", "")
-        
+
         if not agent:
             logger.warning("Cannot wrap tool with PostToolProcessor: missing 'agent'")
             return tool
-            
+
         # If the tool is already wrapped by another wrapper, we need to get the innermost tool
         actual_tool = tool
-            
+
         return PostToolProcessor(
             wrapped_tool=actual_tool,
             user_query=user_query,
@@ -871,30 +860,36 @@ class PostToolProcessingWrapper(BaseToolWrapper):
 
 # === Pre Tool Validation Implementation ===
 
+
 def _check_sparc_available():
     """Check if SPARC is available by attempting import. Cached after first call."""
     global SPARCReflectionRunInput, SPARCExecutionMode, Track
-    global SPARCReflectionComponent, AgentPhase, ComponentConfig, get_llm
-    
+    global SPARCReflectionComponent
+    # AgentPhase, ComponentConfig, get_llm
+
     if SPARCReflectionComponent is not None:
         return True  # Already successfully imported
-    
+
     try:
-        from altk.pre_tool_reflection_toolkit.core import (
-            SPARCReflectionRunInput as _SPARCReflectionRunInput,
+        from altk.pre_tool.core import (
             SPARCExecutionMode as _SPARCExecutionMode,
+        )
+        from altk.pre_tool.core import (
+            SPARCReflectionRunInput as _SPARCReflectionRunInput,
+        )
+        from altk.pre_tool.core import (
             Track as _Track,
         )
-        from altk.pre_tool_reflection_toolkit.sparc import (
+        from altk.pre_tool.sparc import (
             SPARCReflectionComponent as _SPARCReflectionComponent,
         )
-        
+
         # Assign to module-level variables
         SPARCReflectionRunInput = _SPARCReflectionRunInput
         SPARCExecutionMode = _SPARCExecutionMode
         Track = _Track
         SPARCReflectionComponent = _SPARCReflectionComponent
-        
+
         logger.info("✅ SPARC toolkit successfully imported and available")
         return True
     except ImportError as e:
@@ -905,38 +900,17 @@ def _check_sparc_available():
         return False
 
 
-
-class ToolValidationCallbackHandler(BaseCallbackHandler):
-    """
-    Callback handler for logging tool validation events.
-    """
-    
-    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs) -> None:
-        """Called when a tool starts running."""
-        tool_name = serialized.get("name", "unknown_tool")
-        logger.info(f"Tool {tool_name} starting execution")
-    
-    def on_tool_end(self, output: str, **kwargs) -> None:
-        """Called when a tool finishes running successfully."""
-        logger.info("Tool execution completed successfully")
-    
-    def on_tool_error(self, error: Exception, **kwargs) -> None:
-        """Called when a tool encounters an error."""
-        logger.info(f"Tool execution failed with error: {error}")
-
-
-
-
 # === Combined Enhanced Agent Component ===
+
 
 class EnhancedAgentComponent(AgentComponent):
     """Enhanced Agent with both pre-tool validation and post-tool processing capabilities.
-    
+
     This agent combines the functionality of both ALTKAgent and AgentReflection components,
     implementing a modular pipeline for tool processing that can be extended with
     additional capabilities in the future.
     """
-    
+
     display_name: str = "Enhanced Agent"
     description: str = "Advanced agent with both pre-tool validation and post-tool processing capabilities."
     documentation: str = "https://docs.langflow.org/agents"
@@ -957,7 +931,18 @@ class EnhancedAgentComponent(AgentComponent):
         openai_inputs_filtered = []
 
     inputs = [
-        *AgentComponent.inputs,
+        DropdownInput(
+            name="agent_llm",
+            display_name="Model Provider",
+            info="The provider of the language model that the agent will use to generate responses.",
+            options=[*MODEL_PROVIDERS_LIST],
+            value="OpenAI",
+            real_time_refresh=True,
+            refresh_button=False,
+            input_types=[],
+            options_metadata=[MODELS_METADATA[key] for key in MODEL_PROVIDERS_LIST if key in MODELS_METADATA],
+        ),
+        *get_parent_agent_inputs(),
         BoolInput(
             name="enable_tool_validation",
             display_name="Tool Validation",
@@ -975,7 +960,7 @@ class EnhancedAgentComponent(AgentComponent):
             display_name="ToolGuard Business Policies",
             info="Company business policies: concise, well-defined, self-contained policies, one in a line.",
             value="<example: division by zero is prohibited>",
-            #show_if={"enable_tool_guard": True},  # conditional visibility  #todo: check how to do that
+            # show_if={"enable_tool_guard": True},  # conditional visibility  #TODO: check how to do that
             advanced=False,
         ),
         BoolInput(
@@ -995,13 +980,13 @@ class EnhancedAgentComponent(AgentComponent):
     outputs = [
         Output(name="response", display_name="Response", method="message_response"),
     ]
-    
+
     def __init__(self, **kwargs):
         # Default values for configuration flags
         super().__init__(**kwargs)
         self.pipeline_manager = ToolPipelineManager()
         self._initialize_tool_wrappers()
-    
+
     def _initialize_tool_wrappers(self):
         """Initialize tool wrappers based on enabled features."""
         # Add post-tool processing first (innermost wrapper)
@@ -1014,7 +999,7 @@ class EnhancedAgentComponent(AgentComponent):
         # Add pre-tool tool guard execution (should run after tool validation)
         if self.enable_tool_guard:
             pre_tool_guard = PreToolGuardWrapper()
-            #pre_tool_guard.tool_specs = self.tools  # agent tools' data not yet available
+            # pre_tool_guard.tool_specs = self.tools  # agent tools' data not yet available
             self.pipeline_manager.add_wrapper(pre_tool_guard)
 
         # Add pre-tool validation last (outermost wrapper)
@@ -1022,27 +1007,11 @@ class EnhancedAgentComponent(AgentComponent):
             pre_validator = PreToolValidationWrapper()
             self.pipeline_manager.add_wrapper(pre_validator)
 
-    async def run_agent(
-        self,
-        agent: Runnable | BaseSingleActionAgent | BaseMultiActionAgent | AgentExecutor,
-    ) -> Message:
-        """Run the agent with the enhanced tool pipeline.
-        
-        This method combines both pre-tool validation and post-tool processing
-        capabilities based on the enabled features.
-        
-        Args:
-            agent: The agent to run
-            
-        Returns:
-            A message with the agent's response
-        """
-        # Prepare input and extract user query
-        input_dict: dict[str, str | list[BaseMessage]] = {
-            "input": self.input_value.to_lc_message() if isinstance(self.input_value, Message) else self.input_value
-        }
-        user_query = input_dict["input"].content if hasattr(input_dict["input"], "content") else input_dict["input"]
-        
+    def update_runnable_instance(
+        self, agent: AgentExecutor, runnable: AgentExecutor, tools: Sequence[BaseTool]
+    ) -> AgentExecutor:
+        user_query = self.input_value.get_text() if hasattr(self.input_value, "get_text") else self.input_value
+
         # Prepare conversation context for tool validation
         conversation_context = []
         if hasattr(self, "input_value") and self.input_value:
@@ -1050,57 +1019,75 @@ class EnhancedAgentComponent(AgentComponent):
                 conversation_context.append(self.input_value.to_lc_message())
             else:
                 conversation_context.append(HumanMessage(content=str(self.input_value)))
-        
+
         if hasattr(self, "chat_history") and self.chat_history:
             if isinstance(self.chat_history, Data):
                 conversation_context.extend(data_to_messages(self.chat_history))
             elif all(isinstance(m, Message) for m in self.chat_history):
                 conversation_context.extend([m.to_lc_message() for m in self.chat_history])
-        
+
         # Process tools through the pipeline
         processed_tools = self.pipeline_manager.process_tools(
-            self.tools or [], 
-            agent=agent, 
+            tools or [],
+            agent=agent,
             user_query=user_query,
             conversation_context=conversation_context,
             enable_validation=self.enable_tool_validation,
             enable_tool_guard=self.enable_tool_guard,
         )
-        
-        # Set up the runnable agent
+
+        runnable.tools = processed_tools
+
+        return runnable
+
+    async def run_agent(
+        self,
+        agent: Runnable | BaseSingleActionAgent | BaseMultiActionAgent | AgentExecutor,
+    ) -> Message:
         if isinstance(agent, AgentExecutor):
             runnable = agent
-            # Update the tools in the existing AgentExecutor
-            runnable.tools = processed_tools
         else:
-            # Create AgentExecutor from agent and tools
+            # note the tools are not required to run the agent, hence the validation removed.
             handle_parsing_errors = hasattr(self, "handle_parsing_errors") and self.handle_parsing_errors
             verbose = hasattr(self, "verbose") and self.verbose
             max_iterations = hasattr(self, "max_iterations") and self.max_iterations
             runnable = AgentExecutor.from_agent_and_tools(
                 agent=agent,
-                tools=processed_tools,
+                tools=self.tools or [],
                 handle_parsing_errors=handle_parsing_errors,
                 verbose=verbose,
                 max_iterations=max_iterations,
-                return_intermediate_steps=True,
             )
+        runnable = self.update_runnable_instance(agent, runnable, self.tools)
 
-        # Set system prompt if available
+        # Convert input_value to proper format for agent
+        if hasattr(self.input_value, "to_lc_message") and callable(self.input_value.to_lc_message):
+            lc_message = self.input_value.to_lc_message()
+            input_text = lc_message.content if hasattr(lc_message, "content") else str(lc_message)
+        else:
+            lc_message = None
+            input_text = self.input_value
+
+        input_dict: dict[str, str | list[BaseMessage]] = {}
         if hasattr(self, "system_prompt"):
             input_dict["system_prompt"] = self.system_prompt
-            
-        # Set chat history if available
         if hasattr(self, "chat_history") and self.chat_history:
-            if isinstance(self.chat_history, Data):
+            if (
+                hasattr(self.chat_history, "to_data")
+                and callable(self.chat_history.to_data)
+                and self.chat_history.__class__.__name__ == "Data"
+            ):
+                input_dict["chat_history"] = data_to_messages(self.chat_history)
+            # Handle both lfx.schema.message.Message and langflow.schema.message.Message types
+            if all(hasattr(m, "to_data") and callable(m.to_data) and "text" in m.data for m in self.chat_history):
                 input_dict["chat_history"] = data_to_messages(self.chat_history)
             if all(isinstance(m, Message) for m in self.chat_history):
                 input_dict["chat_history"] = data_to_messages([m.to_data() for m in self.chat_history])
+        if hasattr(lc_message, "content") and isinstance(lc_message.content, list):
+            # ! Because the input has to be a string, we must pass the images in the chat_history
 
-        # Handle image content in input
-        if hasattr(input_dict["input"], "content") and isinstance(input_dict["input"].content, list):
-            image_dicts = [item for item in input_dict["input"].content if item.get("type") == "image"]
-            input_dict["input"].content = [item for item in input_dict["input"].content if item.get("type") != "image"]
+            image_dicts = [item for item in lc_message.content if item.get("type") == "image"]
+            lc_message.content = [item for item in lc_message.content if item.get("type") != "image"]
 
             if "chat_history" not in input_dict:
                 input_dict["chat_history"] = []
@@ -1108,8 +1095,7 @@ class EnhancedAgentComponent(AgentComponent):
                 input_dict["chat_history"].extend(HumanMessage(content=[image_dict]) for image_dict in image_dicts)
             else:
                 input_dict["chat_history"] = [HumanMessage(content=[image_dict]) for image_dict in image_dicts]
-
-        # Get session ID
+        input_dict["input"] = input_text
         if hasattr(self, "graph"):
             session_id = self.graph.session_id
         elif hasattr(self, "_session_id"):
@@ -1117,29 +1103,23 @@ class EnhancedAgentComponent(AgentComponent):
         else:
             session_id = None
 
-        # Create agent message for tracking
+        try:
+            sender_name = get_chat_output_sender_name(self)
+        except AttributeError:
+            sender_name = self.display_name or "AI"
+
         agent_message = Message(
             sender=MESSAGE_SENDER_AI,
-            sender_name=self.display_name or "Enhanced Agent",
-            properties={"icon": "Zap", "state": "partial"},
+            sender_name=sender_name,
+            properties={"icon": "Bot", "state": "partial"},
             content_blocks=[ContentBlock(title="Agent Steps", contents=[])],
             session_id=session_id or uuid.uuid4(),
         )
-
         try:
-            # Set up callbacks
-            callbacks_to_be_used = [AgentAsyncHandler(self.log), *self.get_langchain_callbacks()]
-            
-            # Add validation callback if tool validation is enabled
-            if self.enable_tool_validation or self.enable_tool_guard:
-                validation_handler = ToolValidationCallbackHandler()
-                callbacks_to_be_used.append(validation_handler)
-
-            # Run the agent with the enhanced tools
             result = await process_agent_events(
                 runnable.astream_events(
                     input_dict,
-                    config={"callbacks": callbacks_to_be_used},
+                    config={"callbacks": [AgentAsyncHandler(self.log), *self.get_langchain_callbacks()]},
                     version="v2",
                 ),
                 agent_message,
@@ -1153,7 +1133,8 @@ class EnhancedAgentComponent(AgentComponent):
             logger.error(f"ExceptionWithMessageError: {e}")
             raise
         except Exception as e:
-            logger.error(f"Error in agent execution: {e}")
+            # Log or handle any other exceptions
+            logger.error(f"Error: {e}")
             raise
 
         self.status = result
