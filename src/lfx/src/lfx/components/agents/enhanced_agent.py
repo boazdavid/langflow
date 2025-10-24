@@ -965,7 +965,7 @@ class EnhancedAgentComponent(AgentComponent):
         ),
         BoolInput(
             name="enable_post_tool_reflection",
-            display_name="Post Tool Processing",
+            display_name="Post Tool JSON Processing",
             info="Processes tool output through JSON analysis.",
             value=True,
         ),
