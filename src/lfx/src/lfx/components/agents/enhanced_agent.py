@@ -8,9 +8,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
-
 from altk.core.llm import get_llm
-from altk.core.toolkit import AgentPhase
+from altk.core.toolkit import AgentPhase, ComponentConfig
 from altk.post_tool.code_generation.code_generation import (
     CodeGenerationComponent,
     CodeGenerationComponentConfig,
@@ -145,9 +144,7 @@ class ValidatedTool(BaseTool):
     def _validate_and_run(self, *args, **kwargs) -> str:
         """Validate the tool call using SPARC and execute if valid."""
         # Check if validation should be bypassed
-        if not _check_sparc_available() or not self.sparc_component or kwargs.get("bypass_validation", False):
-            if kwargs.get("bypass_validation", False):
-                kwargs.pop("bypass_validation", None)
+        if not _check_sparc_available() or not self.sparc_component:
             return self._execute_tool(*args, **kwargs)
 
         # Prepare tool call for SPARC validation
@@ -156,6 +153,10 @@ class ValidatedTool(BaseTool):
             "type": "function",
             "function": {"name": self.name, "arguments": json.dumps(self._prepare_arguments(*args, **kwargs))},
         }
+
+        if isinstance(self.conversation_context, list) and isinstance(self.conversation_context[0], BaseMessage):
+            logger.debug("Converting BaseMessages to list of dictionaries for conversation context of SPARC")
+            self.conversation_context = [dict(msg) for msg in self.conversation_context]
 
         try:
             # Run SPARC validation
