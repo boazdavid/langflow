@@ -14,6 +14,13 @@ from altk.post_tool.code_generation.code_generation import (
     CodeGenerationComponent,
     CodeGenerationComponentConfig,
 )
+
+from altk.pre_tool.sparc import SPARCReflectionComponent
+from altk.pre_tool.core import (
+    SPARCExecutionMode,
+    Track,
+    SPARCReflectionRunInput
+)
 from altk.post_tool.core.toolkit import CodeGenerationRunInput
 from dotenv import load_dotenv
 from langchain.agents import AgentExecutor, BaseMultiActionAgent, BaseSingleActionAgent
@@ -55,13 +62,6 @@ def get_parent_agent_inputs():
     return [
         input_field for input_field in AgentComponent.inputs if input_field.name not in INPUT_NAMES_TO_BE_OVERRIDDEN
     ]
-
-
-# SPARC imports - use lazy loading to avoid module caching issues
-SPARCReflectionRunInput = None
-SPARCExecutionMode = None
-Track = None
-SPARCReflectionComponent = None
 
 
 # === Base Tool Wrapper Architecture ===
@@ -119,9 +119,10 @@ class ValidatedTool(BaseTool):
     conversation_context: list[BaseMessage] = Field(default_factory=list)
     tool_specs: list[dict] = Field(default_factory=list)
     validation_attempts: dict[str, int] = Field(default_factory=dict)
+    agent: Runnable | BaseSingleActionAgent | BaseMultiActionAgent | AgentExecutor = Field(...)
 
     def __init__(
-        self, wrapped_tool: BaseTool, sparc_component=None, conversation_context=None, tool_specs=None, **kwargs
+        self, wrapped_tool: BaseTool, agent, sparc_component=None, conversation_context=None, tool_specs=None, **kwargs
     ):
         super().__init__(
             name=wrapped_tool.name,
@@ -130,21 +131,32 @@ class ValidatedTool(BaseTool):
             sparc_component=sparc_component,
             conversation_context=conversation_context or [],
             tool_specs=tool_specs or [],
+            agent=agent,
             **kwargs,
         )
 
     def _run(self, *args, **kwargs) -> str:
         """Execute the tool with validation."""
+        self.sparc_component = SPARCReflectionComponent(
+                config=ComponentConfig(llm_client=self._get_altk_llm_object()),
+                track=Track.FAST_TRACK,  # Use fast track for performance
+                execution_mode=SPARCExecutionMode.SYNC,  # Use SYNC to avoid event loop conflicts
+            )
         return self._validate_and_run(*args, **kwargs)
 
     async def _arun(self, *args, **kwargs) -> str:
         """Async execute the tool with validation."""
+        self.sparc_component = SPARCReflectionComponent(
+                config=ComponentConfig(llm_client=self._get_altk_llm_object()),
+                track=Track.FAST_TRACK,  # Use fast track for performance
+                execution_mode=SPARCExecutionMode.SYNC,  # Use SYNC to avoid event loop conflicts
+            )
         return self._validate_and_run(*args, **kwargs)
 
     def _validate_and_run(self, *args, **kwargs) -> str:
         """Validate the tool call using SPARC and execute if valid."""
         # Check if validation should be bypassed
-        if not _check_sparc_available() or not self.sparc_component:
+        if not self.sparc_component:
             return self._execute_tool(*args, **kwargs)
 
         # Prepare tool call for SPARC validation
@@ -252,6 +264,32 @@ class ValidatedTool(BaseTool):
         """Update the conversation context."""
         self.conversation_context = conversation_context
 
+    def _get_altk_llm_object(self) -> Any:
+        # Extract the LLM model and map it to altk model inputs
+        llm_object: BaseChatModel | None = None
+        steps = getattr(self.agent, "steps", None)
+        if steps:
+            for step in steps:
+                if isinstance(step, RunnableBinding) and isinstance(step.bound, BaseChatModel):
+                    llm_object = step.bound
+                    break
+        if isinstance(llm_object, ChatAnthropic):
+            # litellm needs the prefix to the model name for anthropic
+            model_name = f"anthropic/{llm_object.model}"
+            api_key = llm_object.anthropic_api_key.get_secret_value()
+            llm_client = get_llm("litellm.output_val")
+            llm_client_obj = llm_client(model_name=model_name, api_key=api_key)
+        elif isinstance(llm_object, ChatOpenAI):
+            model_name = llm_object.model_name
+            api_key = llm_object.openai_api_key.get_secret_value()
+            llm_client = get_llm("openai.sync.output_val")
+            llm_client_obj = llm_client(model=model_name, api_key=api_key)
+        else:
+            logger.info("ALTK currently only supports OpenAI and Anthropic models through Langflow.")
+            llm_client_obj = None
+
+        return llm_client_obj
+
 
 class ProtectedTool(BaseTool):
     """A wrapper tool that validates calls before execution using ToolGuard component.
@@ -355,7 +393,7 @@ class PreToolValidationWrapper(BaseToolWrapper):
     def __init__(self):
         self.sparc_component = None
         self.tool_specs = []
-        self.available = self._initialize_sparc_component()
+        self.available = True
 
     def wrap_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         """Wrap a tool with validation functionality.
@@ -375,6 +413,8 @@ class PreToolValidationWrapper(BaseToolWrapper):
             return tool
         logger.info(f"Tool validation enabled for {tool.name}")
 
+        agent = kwargs.get("agent")
+
         if isinstance(tool, ValidatedTool):
             # Already wrapped, update context and tool specs
             tool.sparc_component = self.sparc_component
@@ -387,6 +427,7 @@ class PreToolValidationWrapper(BaseToolWrapper):
         # Wrap with validation
         validated_tool = ValidatedTool(
             wrapped_tool=tool,
+            agent=agent,
             sparc_component=self.sparc_component,
             tool_specs=self.tool_specs,
             conversation_context=kwargs.get("conversation_context", []),
@@ -403,67 +444,6 @@ class PreToolValidationWrapper(BaseToolWrapper):
     def is_available(self) -> bool:
         """Check if the SPARC component is available."""
         return self.available
-
-    def _initialize_sparc_component(self) -> bool:
-        """Initialize the SPARC reflection component if available."""
-        # Use lazy loading to check SPARC availability
-        if not _check_sparc_available():
-            logger.warning("SPARC toolkit not available - tool validation will be disabled")
-            return False
-
-        try:
-            # Try to load .env from project root
-            env_path = Path(__file__).parents[6] / ".env"  # Navigate up to project root
-            if env_path.exists():
-                load_dotenv(env_path)
-                logger.debug(f"Loaded .env from {env_path}")
-            else:
-                load_dotenv()  # Try default locations
-                logger.debug("Loaded .env from default location")
-
-            logger.info("Initializing SPARC reflection component...")
-
-            # Check if required environment variables are available
-            api_key = os.getenv("WX_API_KEY")
-            project_id = os.getenv("WX_PROJECT_ID")
-            url = os.getenv("WX_URL", "https://us-south.ml.cloud.ibm.com")
-
-            if not api_key or not project_id:
-                logger.warning("WatsonX credentials not found in environment - SPARC validation will be disabled")
-                logger.info("Set WX_API_KEY and WX_PROJECT_ID environment variables to enable SPARC")
-                return False
-
-            logger.info(f"Using WatsonX URL: {url}")
-            logger.info(f"Using project ID: {project_id[:8]}...")
-
-            # Build ComponentConfig with WatsonX ValidatingLLMClient
-            WATSONX_CLIENT = get_llm("watsonx.output_val")
-
-            config = ComponentConfig(
-                llm_client=WATSONX_CLIENT(
-                    model_id="meta-llama/llama-4-maverick-17b-128e-instruct-fp8",
-                    api_key=api_key,
-                    project_id=project_id,
-                    url=url,
-                )
-            )
-
-            self.sparc_component = SPARCReflectionComponent(
-                config=config,
-                track=Track.FAST_TRACK,  # Use fast track for performance
-                execution_mode=SPARCExecutionMode.SYNC,  # Use SYNC to avoid event loop conflicts
-            )
-
-            if hasattr(self.sparc_component, "_initialization_error") and self.sparc_component._initialization_error:
-                logger.error(f"SPARC component has initialization error: {self.sparc_component._initialization_error}")
-                return False
-            logger.info("✅ SPARC reflection component initialized successfully")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error initializing SPARC component: {e}")
-            logger.exception("Full traceback:")
-            return False
 
     @staticmethod
     def convert_langchain_tools_to_sparc_tool_specs_format(tools: list[BaseTool]) -> list[dict]:
@@ -857,48 +837,6 @@ class PostToolProcessingWrapper(BaseToolWrapper):
             agent=agent,
             response_processing_size_threshold=self.response_processing_size_threshold,
         )
-
-
-# === Pre Tool Validation Implementation ===
-
-
-def _check_sparc_available():
-    """Check if SPARC is available by attempting import. Cached after first call."""
-    global SPARCReflectionRunInput, SPARCExecutionMode, Track
-    global SPARCReflectionComponent
-    # AgentPhase, ComponentConfig, get_llm
-
-    if SPARCReflectionComponent is not None:
-        return True  # Already successfully imported
-
-    try:
-        from altk.pre_tool.core import (
-            SPARCExecutionMode as _SPARCExecutionMode,
-        )
-        from altk.pre_tool.core import (
-            SPARCReflectionRunInput as _SPARCReflectionRunInput,
-        )
-        from altk.pre_tool.core import (
-            Track as _Track,
-        )
-        from altk.pre_tool.sparc import (
-            SPARCReflectionComponent as _SPARCReflectionComponent,
-        )
-
-        # Assign to module-level variables
-        SPARCReflectionRunInput = _SPARCReflectionRunInput
-        SPARCExecutionMode = _SPARCExecutionMode
-        Track = _Track
-        SPARCReflectionComponent = _SPARCReflectionComponent
-
-        logger.info("✅ SPARC toolkit successfully imported and available")
-        return True
-    except ImportError as e:
-        logger.warning(f"SPARC toolkit not available: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Error importing SPARC toolkit: {e}")
-        return False
 
 
 # === Combined Enhanced Agent Component ===
