@@ -39,7 +39,7 @@ from lfx.base.models.model_input_constants import MODEL_PROVIDERS_DICT, MODELS_M
 from lfx.components.agents import AgentComponent
 from lfx.components.helpers.memory import MemoryComponent
 from lfx.inputs.inputs import BoolInput
-from lfx.io import DropdownInput, IntInput, MultilineInput, Output
+from lfx.io import DropdownInput, IntInput, MultilineInput, MessageTextInput, Output
 from lfx.log.logger import logger
 from lfx.memory import delete_message
 from lfx.schema.content_block import ContentBlock
@@ -293,7 +293,7 @@ class ValidatedTool(BaseTool):
 
 class ProtectedTool(BaseTool):
     """A wrapper tool that validates calls before execution using ToolGuard component.
-    Falls back to simple validation if ToolGuard is not available.
+    In case of error in ToolGuard code execution, the tool is activated w/o the guard code.
 
     """
 
@@ -335,6 +335,7 @@ class ProtectedTool(BaseTool):
         try:
             from lfx.components.agents.tool_guards.tool_guard import tool_guard_validation
 
+            # ToolGuard invocation point
             result = tool_guard_validation(
                 fc=[tool_guard_arguments],
                 messages=self.conversation_context,
@@ -342,9 +343,9 @@ class ProtectedTool(BaseTool):
             )
 
             if result["valid"]:  # tool guard returned Ok
-                logger.info(f"✅ ToolGuard evaluated and approved running {self.name}")
+                logger.info(f"🔒️[Ok] ToolGuard evaluated and approved running {self.name}")
                 return self._execute_tool(*args, **kwargs)
-            logger.info(f"❌ ToolGuard evaluated and rejected running {self.name}")
+            logger.info(f"🔒️[X] ToolGuard evaluated and rejected running {self.name}")
             error_msg = result["error_msg"]
             return error_msg
 
@@ -354,7 +355,6 @@ class ProtectedTool(BaseTool):
             return self._execute_tool(*args, **kwargs)
 
     def _prepare_arguments(self, *args, **kwargs) -> dict[str, Any]:
-        """..."""
         # remove config parameter if present (not needed for validation)
         clean_kwargs = {k: v for k, v in kwargs.items() if k != "config"}
         return clean_kwargs
@@ -579,8 +579,11 @@ class PreToolGuardWrapper(BaseToolWrapper):
 
     def _initialize_tool_guard_component(self) -> bool:
         """Initialize the tool guard component if available."""
-        # TODO: implement this function when ToolGuard is available on altk
-        logger.info("🔒️ToolGuard mock implementation initialized successfully")
+        # TODO: (if necessary) implement this function when ToolGuard is available on altk
+
+        logger.info(f"🔒️ToolGuard initialization with tool specs: {self.tool_specs}")
+        logger.info("🔒️ToolGuard implementation initialized successfully")
+
         return True
 
 
@@ -894,13 +897,20 @@ class EnhancedAgentComponent(AgentComponent):
             info="If true, invokes ToolGuard code prior to tool execution, ensuring that tool-related policies are enforced.",
             value=True,
         ),
-        MultilineInput(
-            name="policies",
-            display_name="ToolGuard Business Policies",
-            info="Company business policies: concise, well-defined, self-contained policies, one in a line.",
-            value="<example: division by zero is prohibited>",
-            # show_if={"enable_tool_guard": True},  # conditional visibility  #TODO: check how to do that
-            advanced=False,
+        # MultilineInput(
+        #     name="policies",
+        #     display_name="ToolGuard Business Policies",
+        #     info="Company business policies: concise, well-defined, self-contained policies, one in a line.",
+        #     value="<example: division by zero is prohibited>",
+        #     # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+        #     advanced=False,
+        # ),
+        MessageTextInput(
+            name="guards_code",
+            display_name="ToolGuards Code",
+            info="Automatically generated ToolGuards code",
+            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+            #advanced=False,
         ),
         BoolInput(
             name="enable_post_tool_reflection",
