@@ -11,8 +11,8 @@ class PoliciesComponent(LCToolsAgentComponent):
     def create_agent_runnable(self) -> Runnable:
         pass
 
-    display_name = "Business Policies"
-    description = "A list of clear and concise policies - one in a line, atomic and self-contained."
+    display_name = "ToolGuard Buildtime"
+    description = "Buildtime (offline) component converting textual policies to executable ToolGuard code."
     documentation: str = "..."  # once we have a URL or alike
     icon = "clipboard-check"  # consider also file-text
     name = "policies"
@@ -21,7 +21,7 @@ class PoliciesComponent(LCToolsAgentComponent):
     inputs = [
         MultilineInput(
             name="policies",
-            display_name="ToolGuard Business Policies",
+            display_name="Business Policies",
             info="Company business policies: concise, well-defined, self-contained policies, one in a line.",
             value="<example: division by zero is prohibited>",
             # advanced=True,
@@ -50,6 +50,11 @@ class PoliciesComponent(LCToolsAgentComponent):
             logger.error("🔒️ToolGuard: Policies cannot be empty!")
 
         # TODO: the actual buildtime code should come here, and the final result assigned to guard_code
-        guard_code = "generated python code"
-
+        guard_code = f"def book_reservation_guard(args, history, api):\n" \
+                     f"     if int(args.passengers) == 0:\n" \
+                     f"         raise PolicyValidationException('A reservation must have at least one passenger.')\n" \
+                     f"     if int(args.passengers) > 5:\n" \
+                     f"         raise PolicyValidationException('A reservation can include up to five passengers.')\n" \
+                     f"     ... \n"
+                    
         return Message(text=guard_code, sender="toolguard buildtime")

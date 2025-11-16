@@ -335,11 +335,11 @@ class ProtectedTool(BaseTool):
         try:
             from lfx.components.agents.tool_guards.tool_guard import tool_guard_validation
 
-            # ToolGuard invocation point
+            # toolGuard invocation point
             result = tool_guard_validation(
                 fc=[tool_guard_arguments],
                 messages=self.conversation_context,
-                tool_specs=self.tool_specs,
+                tools=self.tool_specs,
             )
 
             if result["valid"]:  # tool guard returned Ok
@@ -905,13 +905,13 @@ class EnhancedAgentComponent(AgentComponent):
         #     # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
         #     advanced=False,
         # ),
-        MessageTextInput(
-            name="guards_code",
-            display_name="ToolGuards Code",
-            info="Automatically generated ToolGuards code",
-            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
-            #advanced=False,
-        ),
+        # MessageTextInput(
+        #     name="guards_code",
+        #     display_name="ToolGuards Code",
+        #     info="Automatically generated ToolGuards code",
+        #     # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+        #     #advanced=False,
+        # ),
         BoolInput(
             name="enable_post_tool_reflection",
             display_name="Post Tool JSON Processing",
