@@ -1,6 +1,11 @@
 import asyncio
 from typing import cast
+from typing import Any, Callable
+
+from lfx.io import MessageTextInput
 from langflow.inputs import MultilineInput
+from pydantic import BaseModel
+
 from lfx.base.agents.agent import LCToolsAgentComponent
 from lfx.io import Output
 
@@ -9,10 +14,10 @@ from lfx.schema.message import Message
 from lfx.log.logger import logger
 from os.path import join
 
-# from altk.toolkit_core.llm.base import get_llm
-# from altk.toolkit_core.core.toolkit import AgentPhase
-# from altk.pre_tool_guard_toolkit.pre_tool_guard.pre_tool_guard import PreToolGuardComponent
-# from altk.pre_tool_guard_toolkit.core.types import ToolGuardComponentConfig, ToolGuardBuildInput, ToolGuardBuildOutput 
+from altk.toolkit_core.llm.base import get_llm
+from altk.toolkit_core.core.toolkit import AgentPhase
+from altk.pre_tool_guard_toolkit.pre_tool_guard.pre_tool_guard import PreToolGuardComponent
+from altk.pre_tool_guard_toolkit.core.types import ToolGuardComponentConfig, ToolGuardBuildInput, ToolGuardBuildOutput 
 
 MODEL = "gpt-4o-2024-08-06"
 STEP1 = "Step_1"
@@ -37,6 +42,14 @@ class PoliciesComponent(LCToolsAgentComponent):
             value="<example: division by zero is prohibited>",
             # advanced=True,
         ),
+        MessageTextInput(
+            name="guard_code_path",
+            display_name="ToolGuards Generated Code Path",
+            info="Automatically generated ToolGuards code",
+            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+            #advanced=False,
+        ),
+
         *LCToolsAgentComponent.get_base_inputs()[0:1],
     ]
     outputs = [
@@ -56,34 +69,34 @@ class PoliciesComponent(LCToolsAgentComponent):
 
         if self.policies:
             logger.info(f"🔒️ToolGuard: Building guards for {self.policies}")
-            logger.info(f"🔒️ToolGuard: Using the following tool specs {self.tools}")
+            logger.info(f"🔒️ToolGuard: Using the following tools {self.tools}")
         else:
             logger.error("🔒️ToolGuard: Policies cannot be empty!")
 
-        # OPENAILiteLLMClientOutputVal = get_llm("litellm.output_val")
-        # config = ToolGuardComponentConfig(
-        #     llm_client = OPENAILiteLLMClientOutputVal(
-        #         model_name=MODEL,
-        #         custom_llm_provider="azure",
-        #     )
-        # )
-        # component = PreToolGuardComponent(config = config)
-        # print("tools=", self.tools)
+        OPENAILiteLLMClientOutputVal = get_llm("litellm.output_val")
+        config = ToolGuardComponentConfig(
+            llm_client = OPENAILiteLLMClientOutputVal(
+                model_name=MODEL,
+                custom_llm_provider="azure",
+            )
+        )
+        component = PreToolGuardComponent(config = config)
+        print("tools=", self.tools)
 
-        # work_dir = "example"
-        # toolguard_step1_dir = join(work_dir, STEP1)
-        # out_dir = join(work_dir, STEP2)
-        # build_input = ToolGuardBuildInput(
-        #     policy_text=self.policies,
-        #     tools=self.tools,
-        #     step1_dir = toolguard_step1_dir,
-        #     out_dir=out_dir,
-        #     app_name="my_app"
-        # )
-        # output = cast(ToolGuardBuildOutput, asyncio.run(
-        #     component.aprocess(build_input, phase=AgentPhase.BUILDTIME)
-        # ))
-        # return Message(text=output.generated_code.root_dir, sender="toolguard buildtime")
+        work_dir = "example"
+        toolguard_step1_dir = join(work_dir, STEP1)
+        out_dir = join(work_dir, STEP2)
+        build_input = ToolGuardBuildInput(
+            policy_text=self.policies,
+            tools=self.tools,
+            step1_dir = toolguard_step1_dir,
+            out_dir=out_dir,
+            app_name="my_app"
+        )
+        output = cast(ToolGuardBuildOutput, asyncio.run(
+            component.aprocess(build_input, phase=AgentPhase.BUILDTIME)
+        ))
+        return Message(text=output.generated_code.root_dir, sender="toolguard buildtime")
 
 
         # TODO: the actual buildtime code should come here, and the final result assigned to guard_code
@@ -93,6 +106,8 @@ class PoliciesComponent(LCToolsAgentComponent):
                      f"     if int(args.passengers) > 5:\n" \
                      f"         raise PolicyValidationException('A reservation can include up to five passengers.')\n" \
                      f"     ... \n"
-                    
+
+        guard_code += ('\n\n' + self.guard_code_path)
+
         return Message(text=guard_code, sender="toolguard buildtime")
     
