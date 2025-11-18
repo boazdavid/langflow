@@ -303,9 +303,11 @@ class ProtectedTool(BaseTool):
     toolguard_component: Any | None = Field(default=None)
     conversation_context: list[BaseMessage] = Field(default_factory=list)
     tool_specs: list[Callable] = Field(default_factory=list)
+    guard_path: str = Field(...)
 
     def __init__(
-        self, wrapped_tool: BaseTool, toolguard_component=None, conversation_context=None, tool_specs=None, **kwargs
+        self, wrapped_tool: BaseTool, toolguard_component=None, conversation_context=None,
+            tool_specs=None, guard_path=None, **kwargs
     ):
         super().__init__(
             name=wrapped_tool.name,
@@ -314,6 +316,7 @@ class ProtectedTool(BaseTool):
             toolguard_component=toolguard_component,
             conversation_context=conversation_context or [],
             tool_specs=tool_specs or [],
+            guard_path=guard_path,
             **kwargs,
         )
         logger.info(f"🔒️ToolGuard processor initialized for {self.name}")
@@ -337,6 +340,7 @@ class ProtectedTool(BaseTool):
 
             # toolGuard invocation point
             result = tool_guard_validation(
+                path=self.guard_path,
                 fc=[tool_guard_arguments],
                 messages=self.conversation_context,
                 tools=self.tool_specs,
@@ -530,6 +534,7 @@ class PreToolGuardWrapper(BaseToolWrapper):
         self.tool_guard_component = None
         self.tool_specs = []
         self.available = self._initialize_tool_guard_component()
+        self.guard_path = None
 
     def wrap_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         """Wrap a tool with tool guarding functionality.
@@ -548,10 +553,13 @@ class PreToolGuardWrapper(BaseToolWrapper):
             logger.info(f"🔒️ToolGuard explicitly disabled for {tool.name}")
             return tool
 
+        self.guard_path = kwargs.get("guard_path", '<placeholder for path>')
+
         if isinstance(tool, ProtectedTool):
             # Already wrapped, update context and tool specs
             tool.guard = self.tool_guard_component
             tool.tool_specs = self.tool_specs
+            tool.guard_path = self.guard_path
             if "conversation_context" in kwargs:
                 tool.update_context(kwargs["conversation_context"])
             logger.debug(f"🔒️Updated existing {tool.name} with {len(self.tool_specs)} tool specs")
@@ -562,6 +570,7 @@ class PreToolGuardWrapper(BaseToolWrapper):
             wrapped_tool=tool,
             tool_guard_component=self.tool_guard_component,
             tool_specs=self.tool_specs,
+            guard_path=self.guard_path,
             conversation_context=kwargs.get("conversation_context", []),
         )
 
@@ -905,13 +914,13 @@ class EnhancedAgentComponent(AgentComponent):
         #     # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
         #     advanced=False,
         # ),
-        # MessageTextInput(
-        #     name="guards_code",
-        #     display_name="ToolGuards Code",
-        #     info="Automatically generated ToolGuards code",
-        #     # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
-        #     #advanced=False,
-        # ),
+        MessageTextInput(
+            name="toolguard_path",
+            display_name="ToolGuards Code Path",
+            info="...",
+            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+            #advanced=False,
+        ),
         BoolInput(
             name="enable_post_tool_reflection",
             display_name="Post Tool JSON Processing",
@@ -983,6 +992,7 @@ class EnhancedAgentComponent(AgentComponent):
             conversation_context=conversation_context,
             enable_validation=self.enable_tool_validation,
             enable_tool_guard=self.enable_tool_guard,
+            guard_path=self.toolguard_path
         )
 
         runnable.tools = processed_tools

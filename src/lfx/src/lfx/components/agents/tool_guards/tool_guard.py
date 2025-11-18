@@ -5,7 +5,7 @@ from langchain_core.messages import BaseMessage
 from lfx.log.logger import logger
 
 
-def tool_guard_validation(fc: List[Dict], messages: List[BaseMessage], tools: List[Callable]) -> Dict:
+def tool_guard_validation(path: str, fc: List[Dict], messages: List[BaseMessage], tools: List[Callable]) -> Dict:
     """Umbrella function for tool guards invocation
 
     Args:
@@ -20,7 +20,7 @@ def tool_guard_validation(fc: List[Dict], messages: List[BaseMessage], tools: Li
     func = fc[0]['function']['name']
     args = fc[0]['function']['arguments']
 
-    logger.info(f'🔒️ToolGuard invocation for {func}: {func+" guard"}')
+    logger.info(f'🔒️ToolGuard invocation for {func}: {func+" guard"} with guard code at {path}')
 
     # TODO: invoke the appropriate tool guard code
     #  return dictionary with "valid" (bool) and "error_msg" (str)
