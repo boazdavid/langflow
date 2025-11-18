@@ -589,8 +589,6 @@ class PreToolGuardWrapper(BaseToolWrapper):
     def _initialize_tool_guard_component(self) -> bool:
         """Initialize the tool guard component if available."""
         # TODO: (if necessary) implement this function when ToolGuard is available on altk
-
-        logger.info(f"🔒️ToolGuard initialization with tool specs: {self.tool_specs}")
         logger.info("🔒️ToolGuard implementation initialized successfully")
 
         return True
