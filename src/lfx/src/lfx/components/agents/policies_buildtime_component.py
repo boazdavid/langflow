@@ -1,4 +1,9 @@
+from typing import Any, Callable
+
+from lfx.io import MessageTextInput
 from langflow.inputs import MultilineInput
+from pydantic import BaseModel
+
 from lfx.base.agents.agent import LCToolsAgentComponent
 from lfx.io import Output
 
@@ -26,6 +31,14 @@ class PoliciesComponent(LCToolsAgentComponent):
             value="<example: division by zero is prohibited>",
             # advanced=True,
         ),
+        MessageTextInput(
+            name="guard_code_path",
+            display_name="ToolGuards Generated Code Path",
+            info="Automatically generated ToolGuards code",
+            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+            #advanced=False,
+        ),
+
         *LCToolsAgentComponent.get_base_inputs()[0:1],
     ]
     outputs = [
@@ -45,7 +58,7 @@ class PoliciesComponent(LCToolsAgentComponent):
 
         if self.policies:
             logger.info(f"🔒️ToolGuard: Building guards for {self.policies}")
-            logger.info(f"🔒️ToolGuard: Using the following tool specs {self.tools}")
+            logger.info(f"🔒️ToolGuard: Using the following tools {self.tools}")
         else:
             logger.error("🔒️ToolGuard: Policies cannot be empty!")
 
@@ -56,5 +69,7 @@ class PoliciesComponent(LCToolsAgentComponent):
                      f"     if int(args.passengers) > 5:\n" \
                      f"         raise PolicyValidationException('A reservation can include up to five passengers.')\n" \
                      f"     ... \n"
-                    
+
+        guard_code += ('\n\n' + self.guard_code_path)
+
         return Message(text=guard_code, sender="toolguard buildtime")
