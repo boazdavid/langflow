@@ -3,11 +3,12 @@
 from lfx.base.agents.altk_base_agent import ALTKBaseAgentComponent
 from lfx.base.agents.altk_tool_wrappers import (
     PostToolProcessingWrapper,
+    PreToolGuardWrapper,
     PreToolValidationWrapper,
 )
 from lfx.base.models.model_input_constants import MODEL_PROVIDERS_DICT, MODELS_METADATA
 from lfx.components.models_and_agents.memory import MemoryComponent
-from lfx.inputs.inputs import BoolInput
+from lfx.inputs.inputs import BoolInput, MessageTextInput
 from lfx.io import DropdownInput, IntInput, Output
 from lfx.log.logger import logger
 
@@ -80,6 +81,19 @@ class ALTKAgentComponent(ALTKBaseAgentComponent):
             value=True,
         ),
         BoolInput(
+            name="enable_tool_guard",
+            display_name="ToolGuard Execution",
+            info="If true, invokes ToolGuard code prior to tool execution, ensuring that tool-related policies are enforced.",
+            value=True,
+        ),
+        MessageTextInput(
+            name="toolguard_path",
+            display_name="ToolGuards Code Path",
+            info="...",
+            # show_if={"enable_tool_guard": True},  # conditional visibility  # check how to do that
+            #advanced=False,
+        ),
+        BoolInput(
             name="enable_post_tool_reflection",
             display_name="Post Tool JSON Processing",
             info="Processes tool output through JSON analysis.",
@@ -115,6 +129,10 @@ class ALTKAgentComponent(ALTKBaseAgentComponent):
             pre_validator = PreToolValidationWrapper()
             wrappers.append(pre_validator)
 
+        # Add pre-tool tool guard execution (should run after tool validation)
+        if self.enable_tool_guard:
+            wrappers.append(PreToolGuardWrapper())
+
         self.pipeline_manager.configure_wrappers(wrappers)
 
     def update_runnable_instance(self, agent, runnable, tools):
@@ -130,6 +148,11 @@ class ALTKAgentComponent(ALTKBaseAgentComponent):
         for wrapper in self.pipeline_manager.wrappers:
             if isinstance(wrapper, PreToolValidationWrapper) and tools:
                 wrapper.tool_specs = wrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
+            elif isinstance(wrapper, PreToolGuardWrapper) and tools:
+                wrapper.tools = list(tools)
+                # if willing to have a list of json-like tool definitions
+                # wrapper.tool_specs = PreToolValidationWrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
+                # logger.info(f"🔒️Updated tool specs for tool guard execution: {len(wrapper.tool_specs)} tools")
 
         # Process tools with updated specs
         processed_tools = self.pipeline_manager.process_tools(

@@ -2,7 +2,7 @@
 name = "langflow"
 version = "1.7.0"
 description = "A Python package with a built-in web application"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = "MIT"
 keywords = ["nlp", "langchain", "openai", "gpt", "gui"]
 readme = "README.md"
@@ -134,8 +134,8 @@ dependencies = [
     "fastparquet>=2024.11.0,<2025.0.0",
     "traceloop-sdk>=0.43.1,<1.0.0",
     "vlmrun[all]>=0.2.0",
+    "agent-lifecycle-toolkit @ git+ssh://git@github.ibm.com/DAVIDBO/agent-lifecycle-toolkit.git@toolguardonoss",
     "cuga==0.1.10",
-    "agent-lifecycle-toolkit~=0.4.1",
     "astrapy>=2.1.0,<3.0.0",
 ]
 
@@ -500,3 +500,6 @@ ignore_missing_imports = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
