@@ -150,6 +150,7 @@ class ALTKAgentComponent(ALTKBaseAgentComponent):
                 wrapper.tool_specs = wrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
             elif isinstance(wrapper, PreToolGuardWrapper) and tools:
                 wrapper.tools = list(tools)
+                wrapper.guard_path = self.toolguard_path
                 # if willing to have a list of json-like tool definitions
                 # wrapper.tool_specs = PreToolValidationWrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
                 # logger.info(f"🔒️Updated tool specs for tool guard execution: {len(wrapper.tool_specs)} tools")

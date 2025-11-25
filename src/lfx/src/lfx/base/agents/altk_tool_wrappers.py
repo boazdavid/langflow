@@ -687,7 +687,7 @@ class PreToolGuardWrapper(BaseToolWrapper):
             logger.info(f"🔒️ToolGuard explicitly disabled for {tool.name}")
             return tool
 
-        self.guard_path = kwargs.get("guard_path", '<placeholder for path>')
+        # self.guard_path = kwargs.get("guard_path", '<placeholder for path>')
 
         if isinstance(tool, ProtectedTool):
             # Already wrapped, update context and tool specs
