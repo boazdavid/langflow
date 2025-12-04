@@ -3,9 +3,9 @@
 from lfx.base.agents.altk_base_agent import ALTKBaseAgentComponent
 from lfx.base.agents.altk_tool_wrappers import (
     PostToolProcessingWrapper,
-    PreToolGuardWrapper,
     PreToolValidationWrapper,
 )
+from lfx.base.agents.toolguard import PreToolGuardWrapper
 from lfx.base.models.model_input_constants import MODEL_PROVIDERS_DICT, MODELS_METADATA
 from lfx.components.models_and_agents.memory import MemoryComponent
 from lfx.inputs.inputs import BoolInput, MessageTextInput
@@ -143,17 +143,15 @@ class ALTKAgentComponent(ALTKBaseAgentComponent):
 
         # Initialize pipeline (this ensures configure_tool_pipeline is called)
         self._initialize_tool_pipeline()
-
+        logger.info(f"11111 {self.toolguard_path}, {len(tools)}")
         # Update tool specs for validation wrappers BEFORE processing
         for wrapper in self.pipeline_manager.wrappers:
             if isinstance(wrapper, PreToolValidationWrapper) and tools:
                 wrapper.tool_specs = wrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
             elif isinstance(wrapper, PreToolGuardWrapper) and tools:
+                logger.info(f"222 {self.toolguard_path}")
                 wrapper.tools = list(tools)
                 wrapper.guard_path = self.toolguard_path
-                # if willing to have a list of json-like tool definitions
-                # wrapper.tool_specs = PreToolValidationWrapper.convert_langchain_tools_to_sparc_tool_specs_format(tools)
-                # logger.info(f"🔒️Updated tool specs for tool guard execution: {len(wrapper.tool_specs)} tools")
 
         # Process tools with updated specs
         processed_tools = self.pipeline_manager.process_tools(

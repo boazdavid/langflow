@@ -114,10 +114,16 @@ class ALTKBaseTool(BaseTool):
 
     def _run(self, *args, **kwargs) -> str:
         """Abstract method implementation that uses the wrapped tool execution."""
+        logger.debug(f"run() - *args = {args}, **kwargs = {kwargs}")
         return self._execute_tool(*args, **kwargs)
+    
+    async def _arun(self, *args: Any, **kwargs: Any) -> Any:
+        logger.debug(f"3333 arun() - *args = {args}, **kwargs = {kwargs}")
+        return self._execute_tool(args, kwargs)
 
     def _execute_tool(self, *args, **kwargs) -> str:
         """Execute the wrapped tool with compatibility across LC versions."""
+        logger.debug(f"22222run() - *args = {args}, **kwargs = {kwargs}")
         # BaseTool.run() expects tool_input as first argument
         if args:
             # Use first arg as tool_input, pass remaining args
@@ -182,7 +188,9 @@ class ToolPipelineManager:
     def _apply_wrappers_to_tool(self, tool: BaseTool, **kwargs) -> BaseTool:
         wrapped_tool = tool
         for wrapper in reversed(self.wrappers):
+            logger.info(f"_apply_wrappers_to_tool {tool.name}")
             if wrapper.is_available:
+                logger.info(f"calling  wrap_tool() {tool.name} {wrapper.__class__.__name__}")
                 wrapped_tool = wrapper.wrap_tool(wrapped_tool, **kwargs)
         return wrapped_tool
 
@@ -252,27 +260,28 @@ class ALTKBaseAgentComponent(AgentComponent):
         """Initialize the tool pipeline by calling the subclass configuration."""
         self.configure_tool_pipeline()
 
-    def update_runnable_instance(
-        self, agent: AgentExecutor, runnable: AgentExecutor, tools: Sequence[BaseTool]
-    ) -> AgentExecutor:
-        """Update the runnable instance with processed tools.
+    # def update_runnable_instance(
+    #     self, agent: AgentExecutor, runnable: AgentExecutor, tools: Sequence[BaseTool]
+    # ) -> AgentExecutor:
+    #     """Update the runnable instance with processed tools.
 
-        Subclasses can override this method to customize tool processing.
-        The default implementation applies the tool wrapper pipeline.
-        """
-        user_query = self.get_user_query()
-        conversation_context = self.build_conversation_context()
+    #     Subclasses can override this method to customize tool processing.
+    #     The default implementation applies the tool wrapper pipeline.
+    #     """
+    #     logger.info("update_runnable_instance()")
+    #     user_query = self.get_user_query()
+    #     conversation_context = self.build_conversation_context()
 
-        self._initialize_tool_pipeline()
-        processed_tools = self.pipeline_manager.process_tools(
-            list(tools or []),
-            agent=agent,
-            user_query=user_query,
-            conversation_context=conversation_context,
-        )
+    #     self._initialize_tool_pipeline()
+    #     processed_tools = self.pipeline_manager.process_tools(
+    #         list(tools or []),
+    #         agent=agent,
+    #         user_query=user_query,
+    #         conversation_context=conversation_context,
+    #     )
 
-        runnable.tools = processed_tools
-        return runnable
+    #     runnable.tools = processed_tools
+    #     return runnable
 
     async def run_agent(
         self,
