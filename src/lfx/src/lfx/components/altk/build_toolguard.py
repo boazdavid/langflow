@@ -13,9 +13,9 @@ from lfx.schema.message import Message
 from lfx.log.logger import logger
 from os.path import join
 
-from altk.toolkit_core.llm.base import get_llm
-from altk.toolkit_core.core.toolkit import AgentPhase
-from altk.pre_tool_guard_toolkit import PreToolGuardComponent, ToolGuardComponentConfig, ToolGuardBuildInput, ToolGuardBuildOutput
+from altk.core.llm.base import get_llm
+from altk.core.toolkit import AgentPhase
+from altk.pre_tool.toolguard import PreToolGuardComponent, ToolGuardComponentConfig, ToolGuardBuildInput, ToolGuardBuildOutput
 
 MODEL = "gpt-4o-2024-08-06"
 STEP1 = "Step_1"
@@ -91,5 +91,4 @@ class PoliciesComponent(LCToolsAgentComponent):
         output = cast(ToolGuardBuildOutput, asyncio.run(
             component.aprocess(build_input, phase=AgentPhase.BUILDTIME)
         ))
-        return Message(text=output.root_dir, sender="toolguard buildtime")
-
+        return Message(text=output.out_dir, sender="toolguard buildtime")

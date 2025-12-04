@@ -3,13 +3,11 @@ import json
 import uuid
 from typing import Any, Callable
 
-from altk.toolkit_core.core.toolkit import AgentPhase, ComponentConfig
-from altk.post_tool_reflection_toolkit.code_generation.code_generation import CodeGenerationComponent, CodeGenerationComponentConfig
-from altk.post_tool_reflection_toolkit.core.toolkit import CodeGenerationRunInput, CodeGenerationRunOutput
-from altk.pre_tool_reflection_toolkit.core import SPARCExecutionMode, SPARCReflectionRunInput, Track
-from altk.pre_tool_reflection_toolkit.sparc import (
-    SPARCReflectionComponent,
-)
+from altk.core.toolkit import AgentPhase, ComponentConfig
+from altk.post_tool.code_generation.code_generation import CodeGenerationComponent, CodeGenerationComponentConfig
+from altk.post_tool.code_generation.code_generation import CodeGenerationRunInput, CodeGenerationRunOutput
+from altk.pre_tool.sparc.sparc import SPARCExecutionMode, SPARCReflectionRunInput, Track
+from altk.pre_tool.sparc import SPARCReflectionComponent
 from langchain_core.messages import BaseMessage
 from langchain_core.messages.base import message_to_dict
 from langchain_core.tools import BaseTool
