@@ -1,7 +1,4 @@
-import asyncio
-import os
 from typing import cast
-import json
 from lfx.io import MessageTextInput
 from langflow.inputs import MultilineInput
 
@@ -15,7 +12,19 @@ from os.path import join
 
 from altk.core.llm.base import get_llm
 from altk.core.toolkit import AgentPhase
-from altk.pre_tool.toolguard import PreToolGuardComponent, ToolGuardComponentConfig, ToolGuardBuildInput, ToolGuardBuildOutput
+from altk.pre_tool.toolguard.toolguard_spec_component import (
+    ToolGuardSpecComponentConfig,
+    ToolGuardSpecBuildInput,
+    ToolGuardSpecs,
+    ToolGuardSpecComponent
+)
+from altk.pre_tool.toolguard.toolguard_code_component import (
+    ToolGuardCodeComponentConfig,
+    ToolGuardCodeBuildInput,
+    ToolGuardBuildOutput,
+    ToolGuardCodeComponent,
+    MeleaSessionData
+)
 
 MODEL = "gpt-4o-2024-08-06"
 STEP1 = "Step_1"
@@ -57,38 +66,51 @@ class PoliciesComponent(LCToolsAgentComponent):
     def run(self):
         pass
 
-    def build_guards(self) -> Message:
-        """ToolGuard buidtime component (both steps)
-        Args:
-        Returns:
-            A textual message with the generated code for human review
-        """
-
-        if self.policies:
-            logger.info(f"🔒️ToolGuard: Building guards for {self.policies}")
-            logger.info(f"🔒️ToolGuard: Using the following tools {self.tools}")
-        else:
-            logger.error("🔒️ToolGuard: Policies cannot be empty!")
-
-        OPENAILiteLLMClientOutputVal = get_llm("litellm.output_val")
-        config = ToolGuardComponentConfig(
-            llm_client = OPENAILiteLLMClientOutputVal(
+    async def _build_guard_specs(self):
+        LLMClient = get_llm("litellm.output_val")
+        config = ToolGuardSpecComponentConfig(
+            llm_client = LLMClient(
                 model_name=MODEL,
                 custom_llm_provider="azure", #FIXME
             )
         )
-        component = PreToolGuardComponent(config = config)
-
-        work_dir = self.guard_code_path
-        toolguard_step1_dir = join(work_dir, STEP1)
-        out_dir = join(work_dir, STEP2)
-        build_input = ToolGuardBuildInput(
+        component = ToolGuardSpecComponent(config = config)
+        toolguard_step1_dir = join(self.guard_code_path, STEP1)
+        input = ToolGuardSpecBuildInput(
             policy_text=self.policies,
             tools=self.tools,
-            step1_dir = toolguard_step1_dir,
+            out_dir=toolguard_step1_dir,
+        )
+        return cast(
+            ToolGuardSpecs,
+            await component.aprocess(input, phase=AgentPhase.BUILDTIME)
+        )
+
+    async def _build_guard_code(self, specs: ToolGuardSpecs)->ToolGuardBuildOutput:
+        config = ToolGuardCodeComponentConfig(
+            llm_config = MeleaSessionData()
+        )
+        component = ToolGuardCodeComponent(config=config)
+
+        work_dir = self.guard_code_path
+        out_dir = join(work_dir, STEP2)
+        build_input = ToolGuardCodeBuildInput(
+            tools=self.tools,
+            toolguard_specs = specs,
             out_dir=out_dir,
         )
-        output = cast(ToolGuardBuildOutput, asyncio.run(
-            component.aprocess(build_input, phase=AgentPhase.BUILDTIME)
-        ))
-        return Message(text=output.out_dir, sender="toolguard buildtime")
+        output = cast(ToolGuardBuildOutput,
+            await component.aprocess(build_input, phase=AgentPhase.BUILDTIME)
+        )
+        return output
+
+    async def build_guards(self) -> Message:
+        assert self.policies, "🔒️ToolGuard: Policies cannot be empty!"
+
+        logger.info(f"🔒️ToolGuard: Building guards for {self.policies}")
+        logger.info(f"🔒️ToolGuard: Using the following tools {self.tools}")
+
+        specs = await self._build_guard_specs()
+        guards = await self._build_guard_code(specs)
+        
+        return Message(text=guards.out_dir, sender="toolguard buildtime")

@@ -2,19 +2,12 @@ import json
 from typing import Any, List, Dict, cast
 
 from langchain_core.messages import BaseMessage
-from altk.pre_tool.toolguard.toolguard_spec_component import (
-    ToolGuardSpecComponentConfig,
-    ToolGuardSpecBuildInput,
-    ToolGuardSpecs,
-    ToolGuardSpecComponent
-)
 from altk.pre_tool.toolguard.toolguard_code_component import (
     ToolGuardCodeComponentConfig,
-    ToolGuardCodeBuildInput,
-    ToolGuardBuildOutput,
     ToolGuardCodeRunInput,
     ToolGuardCodeRunOutput,
     ToolGuardCodeComponent,
+    
 )
 from altk.pre_tool.toolguard.toolguard.runtime import LangchainToolInvoker
 
@@ -22,7 +15,6 @@ from altk.core.toolkit import AgentPhase
 from lfx.base.agents.altk_base_agent import ALTKBaseTool, BaseToolWrapper
 from lfx.field_typing.constants import BaseTool
 from lfx.log.logger import logger
-from pydantic import Field
 
 
 class GuardedTool(ALTKBaseTool):
@@ -101,7 +93,7 @@ class GuardedTool(ALTKBaseTool):
         """Update the conversation context."""
         self.conversation_context = conversation_context
 
-    def toolguard_validation(self, toolguard_path: str, fc: List[Dict], messages: List[BaseMessage], tools: List[BaseTool]) -> ToolGuardRunOutput:
+    def toolguard_validation(self, toolguard_path: str, fc: List[Dict], messages: List[BaseMessage], tools: List[BaseTool]) -> ToolGuardCodeRunOutput:
         """Umbrella function for tool guards invocation
         Args:
             toolguard_path: path to toolguard generated code
@@ -122,7 +114,7 @@ class GuardedTool(ALTKBaseTool):
             tool_name=tool_name,
             tool_args=tool_args,
             tool_invoker=tool_invoker,
-            messages=messages,
+            messages=[msg.model_dump() for msg in messages],
             metadata={}
         )
         toolguard_output = cast(
