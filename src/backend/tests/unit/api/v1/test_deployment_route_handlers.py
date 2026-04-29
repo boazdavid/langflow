@@ -16,23 +16,27 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from langflow.api.v1.mappers.deployments.contracts import ProviderSnapshotBinding
 from langflow.api.v1.schemas.deployments import (
     DeploymentLlmListResponse,
     DeploymentProviderAccountCreateRequest,
     DeploymentProviderAccountUpdateRequest,
     DeploymentUpdateRequest,
+    SnapshotUpdateRequest,
 )
+from langflow.services.database.models.deployment.exceptions import DeploymentGuardError
 from langflow.services.database.models.deployment_provider_account.schemas import DeploymentProviderKey
 from lfx.services.adapters.deployment.exceptions import (
     AuthenticationError,
-    DeploymentConflictError,
     DeploymentNotFoundError,
+    ResourceConflictError,
     ServiceUnavailableError,
 )
 from lfx.services.adapters.deployment.schema import (
     ConfigListItem,
     ConfigListResult,
     DeploymentCreateResult,
+    DeploymentListParams,
     DeploymentListResult,
     DeploymentUpdateResult,
     ItemResult,
@@ -87,6 +91,35 @@ def _fake_attachment(*, provider_snapshot_id: str | None = None) -> SimpleNamesp
         provider_snapshot_id=provider_snapshot_id,
         deployment_id=uuid4(),
     )
+
+
+class _AsyncNoopSavepoint:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# query parameter validators
+# ---------------------------------------------------------------------------
+
+
+class TestQueryParameterValidators:
+    def test_dedupe_snapshot_names_preserves_order(self):
+        from langflow.api.v1.deployments import _dedupe_snapshot_names
+
+        assert _dedupe_snapshot_names(["my_tool", "other_tool", "my_tool", "third_tool"]) == [
+            "my_tool",
+            "other_tool",
+            "third_tool",
+        ]
+
+    def test_dedupe_snapshot_names_keeps_none(self):
+        from langflow.api.v1.deployments import _dedupe_snapshot_names
+
+        assert _dedupe_snapshot_names(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +577,7 @@ class TestListDeploymentsLoadFromProvider:
         mapper = MagicMock()
         expected = MagicMock()
         mapper.shape_deployment_list_result.return_value = expected
+        mapper.resolve_load_from_provider_deployment_list_params.return_value = {"environment": "draft"}
         mock_get_mapper.return_value = mapper
 
         result = await list_deployments(
@@ -559,6 +593,9 @@ class TestListDeploymentsLoadFromProvider:
         assert result is expected
         mock_list_synced.assert_not_awaited()
         adapter.list.assert_awaited_once()
+        list_call_kwargs = adapter.list.await_args.kwargs
+        assert isinstance(list_call_kwargs["params"], DeploymentListParams)
+        assert list_call_kwargs["params"].provider_params == {"environment": "draft"}
         mapper.shape_deployment_list_result.assert_called_once()
 
     @pytest.mark.asyncio
@@ -682,6 +719,103 @@ class TestListDeploymentsFlowIdsFilter:
 
 
 # ---------------------------------------------------------------------------
+# list_deployments: project_id filter
+# ---------------------------------------------------------------------------
+
+
+class TestListDeploymentsProjectIdFilter:
+    @pytest.mark.asyncio
+    async def test_load_from_provider_rejects_project_id(self):
+        """project_id filtering is not supported when load_from_provider=true."""
+        from langflow.api.v1.deployments import list_deployments
+
+        with pytest.raises(HTTPException) as exc_info:
+            await list_deployments(
+                provider_id=uuid4(),
+                session=AsyncMock(),
+                current_user=_fake_user(),
+                params=SimpleNamespace(page=1, size=20),
+                deployment_type=None,
+                load_from_provider=True,
+                project_id=uuid4(),
+            )
+        assert exc_info.value.status_code == 422
+        assert "project_id" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.list_deployments_synced", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_project_id_threaded_to_synced(
+        self,
+        mock_get_pa,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_list_synced,
+    ):
+        """When project_id is supplied it is forwarded to list_deployments_synced."""
+        from langflow.api.v1.deployments import list_deployments
+
+        pa = _fake_provider_account()
+        mock_get_pa.return_value = pa
+        mock_resolve_adapter.return_value = MagicMock()
+        mapper = MagicMock()
+        mapper.shape_deployment_list_items.return_value = []
+        mock_get_mapper.return_value = mapper
+        mock_list_synced.return_value = ([], 0)
+
+        pid = uuid4()
+        await list_deployments(
+            provider_id=pa.id,
+            session=AsyncMock(),
+            current_user=_fake_user(),
+            params=SimpleNamespace(page=1, size=20),
+            deployment_type=None,
+            load_from_provider=False,
+            project_id=pid,
+        )
+
+        mock_list_synced.assert_awaited_once()
+        assert mock_list_synced.call_args.kwargs["project_id"] == pid
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.list_deployments_synced", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_project_id_none_when_omitted(
+        self,
+        mock_get_pa,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_list_synced,
+    ):
+        """When project_id is not supplied, None is forwarded (no filter)."""
+        from langflow.api.v1.deployments import list_deployments
+
+        pa = _fake_provider_account()
+        mock_get_pa.return_value = pa
+        mock_resolve_adapter.return_value = MagicMock()
+        mapper = MagicMock()
+        mapper.shape_deployment_list_items.return_value = []
+        mock_get_mapper.return_value = mapper
+        mock_list_synced.return_value = ([], 0)
+
+        await list_deployments(
+            provider_id=pa.id,
+            session=AsyncMock(),
+            current_user=_fake_user(),
+            params=SimpleNamespace(page=1, size=20),
+            deployment_type=None,
+            load_from_provider=False,
+        )
+
+        mock_list_synced.assert_awaited_once()
+        assert mock_list_synced.call_args.kwargs["project_id"] is None
+
+
+# ---------------------------------------------------------------------------
 # config/snapshot passthrough listing routes
 # ---------------------------------------------------------------------------
 
@@ -778,6 +912,7 @@ class TestConfigAndSnapshotListRoutes:
         result = await list_deployment_snapshots(
             provider_id=pa.id,
             deployment_id=deployment.id,
+            names=None,
             page=1,
             size=10,
             session=AsyncMock(),
@@ -787,6 +922,7 @@ class TestConfigAndSnapshotListRoutes:
         assert result is expected_response
         mapper.resolve_snapshot_list_adapter_params.assert_awaited_once_with(
             deployment_resource_key="dep-key",
+            snapshot_names=None,
             provider_params=None,
             db=ANY,
         )
@@ -797,6 +933,218 @@ class TestConfigAndSnapshotListRoutes:
             page=1,
             size=10,
         )
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_list_snapshots_rejects_deployment_id_with_names(
+        self,
+        mock_get_pa,
+    ):
+        from langflow.api.v1.deployments import list_deployment_snapshots
+
+        with pytest.raises(HTTPException) as exc_info:
+            await list_deployment_snapshots(
+                provider_id=uuid4(),
+                deployment_id=uuid4(),
+                names=["my_tool"],
+                page=1,
+                size=10,
+                session=AsyncMock(),
+                current_user=_fake_user(),
+            )
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail == "filtering by both deployment_id and names is not supported."
+        mock_get_pa.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_list_snapshots_passes_names_to_mapper(
+        self,
+        mock_get_pa,
+        mock_get_mapper,
+        mock_resolve_adapter,
+    ):
+        from langflow.api.v1.deployments import list_deployment_snapshots
+
+        pa = _fake_provider_account()
+        mock_get_pa.return_value = pa
+        adapter = AsyncMock()
+        adapter.list_snapshots.return_value = SnapshotListResult(
+            snapshots=[SnapshotItem(id="tool-1", name="my_tool")],
+        )
+        mock_resolve_adapter.return_value = adapter
+        mapper = MagicMock()
+        adapter_params = MagicMock()
+        expected_response = MagicMock()
+        mapper.resolve_snapshot_list_adapter_params = AsyncMock(return_value=adapter_params)
+        mapper.shape_snapshot_list_result.return_value = expected_response
+        mock_get_mapper.return_value = mapper
+
+        result = await list_deployment_snapshots(
+            provider_id=pa.id,
+            deployment_id=None,
+            names=["my_tool", "other_tool"],
+            page=1,
+            size=10,
+            session=AsyncMock(),
+            current_user=_fake_user(),
+        )
+
+        assert result is expected_response
+        mapper.resolve_snapshot_list_adapter_params.assert_awaited_once_with(
+            deployment_resource_key=None,
+            snapshot_names=["my_tool", "other_tool"],
+            provider_params=None,
+            db=ANY,
+        )
+
+
+# ---------------------------------------------------------------------------
+# update_snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSnapshotRoute:
+    @pytest.mark.asyncio
+    @patch("langflow.services.database.models.flow_version.crud.get_flow_version_entry", new_callable=AsyncMock)
+    @patch("langflow.services.database.models.deployment.crud.get_deployment", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.update_flow_version_by_provider_snapshot_id", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.get_attachment_by_provider_snapshot_id", new_callable=AsyncMock)
+    async def test_updates_all_attachment_rows_for_snapshot(
+        self,
+        mock_get_attachment,
+        mock_get_pa,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_update_rows,
+        mock_get_deployment_row,
+        mock_get_flow_version,
+    ):
+        from langflow.api.v1.deployments import update_snapshot
+
+        user = _fake_user()
+        flow_id = uuid4()
+        target_flow_version_id = uuid4()
+        attachment = SimpleNamespace(
+            flow_version_id=uuid4(),
+            deployment_id=uuid4(),
+            provider_snapshot_id="tool-1",
+        )
+        deployment = _fake_deployment_row(
+            id=attachment.deployment_id,
+            deployment_provider_account_id=uuid4(),
+        )
+        provider_account = _fake_provider_account()
+        provider_account.id = deployment.deployment_provider_account_id
+
+        mock_get_attachment.return_value = attachment
+        mock_get_deployment_row.return_value = deployment
+        mock_get_flow_version.return_value = SimpleNamespace(id=target_flow_version_id, flow_id=flow_id, data={})
+        mock_get_pa.return_value = provider_account
+        adapter = AsyncMock()
+        mock_resolve_adapter.return_value = adapter
+        mapper = MagicMock()
+        mapper.resolve_snapshot_update_artifact.return_value = {"artifact": "payload"}
+        mock_get_mapper.return_value = mapper
+        mock_update_rows.return_value = 2
+
+        session = AsyncMock()
+        session.get.return_value = SimpleNamespace(id=flow_id)
+
+        response = await update_snapshot(
+            provider_snapshot_id=" tool-1 ",
+            body=SnapshotUpdateRequest(flow_version_id=target_flow_version_id),
+            session=session,
+            current_user=user,
+        )
+
+        assert response.flow_version_id == target_flow_version_id
+        assert response.provider_snapshot_id == "tool-1"
+        mock_get_attachment.assert_awaited_once_with(
+            session,
+            user_id=user.id,
+            provider_snapshot_id="tool-1",
+        )
+        mock_update_rows.assert_awaited_once_with(
+            session,
+            user_id=user.id,
+            provider_snapshot_id="tool-1",
+            flow_version_id=target_flow_version_id,
+        )
+        session.commit.assert_awaited_once()
+        session.rollback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("langflow.services.database.models.flow_version.crud.get_flow_version_entry", new_callable=AsyncMock)
+    @patch("langflow.services.database.models.deployment.crud.get_deployment", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.update_flow_version_by_provider_snapshot_id", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.get_attachment_by_provider_snapshot_id", new_callable=AsyncMock)
+    async def test_commit_failure_attempts_provider_compensation(
+        self,
+        mock_get_attachment,
+        mock_get_pa,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_update_rows,
+        mock_get_deployment_row,
+        mock_get_flow_version,
+    ):
+        from langflow.api.v1.deployments import update_snapshot
+
+        user = _fake_user()
+        flow_id = uuid4()
+        previous_flow_version_id = uuid4()
+        target_flow_version_id = uuid4()
+        attachment = SimpleNamespace(
+            flow_version_id=previous_flow_version_id,
+            deployment_id=uuid4(),
+            provider_snapshot_id="tool-1",
+        )
+        deployment = _fake_deployment_row(
+            id=attachment.deployment_id,
+            deployment_provider_account_id=uuid4(),
+        )
+        provider_account = _fake_provider_account()
+        provider_account.id = deployment.deployment_provider_account_id
+
+        target_version = SimpleNamespace(id=target_flow_version_id, flow_id=flow_id, data={"nodes": []})
+        previous_version = SimpleNamespace(id=previous_flow_version_id, flow_id=flow_id, data={"nodes": []})
+        mock_get_flow_version.side_effect = [target_version, previous_version]
+        mock_get_attachment.return_value = attachment
+        mock_get_deployment_row.return_value = deployment
+        mock_get_pa.return_value = provider_account
+        adapter = AsyncMock()
+        adapter.update_snapshot.return_value = None
+        mock_resolve_adapter.return_value = adapter
+        mapper = MagicMock()
+        mapper.resolve_snapshot_update_artifact.side_effect = [{"artifact": "new"}, {"artifact": "previous"}]
+        mock_get_mapper.return_value = mapper
+        mock_update_rows.return_value = 2
+
+        session = AsyncMock()
+        session.get.return_value = SimpleNamespace(id=flow_id)
+        session.commit.side_effect = RuntimeError("commit failed")
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await update_snapshot(
+                provider_snapshot_id="tool-1",
+                body=SnapshotUpdateRequest(flow_version_id=target_flow_version_id),
+                session=session,
+                current_user=user,
+            )
+
+        session.commit.assert_awaited_once()
+        session.rollback.assert_awaited_once()
+        assert adapter.update_snapshot.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +1230,6 @@ class TestListDeploymentFlowVersionsRoute:
 
 class TestProviderAccountRoutes:
     @pytest.mark.asyncio
-    @patch(f"{ROUTES_MODULE}.to_provider_account_response", return_value={"ok": True})
     @patch(f"{ROUTES_MODULE}.update_provider_account_row", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
     @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
@@ -893,7 +1240,6 @@ class TestProviderAccountRoutes:
         mock_get_mapper,
         mock_resolve_adapter,
         mock_update_provider_account,
-        mock_to_provider_response,  # noqa: ARG002
     ):
         """PATCH skips credential verification when only name changes."""
         from langflow.api.v1.deployments import update_provider_account
@@ -971,9 +1317,8 @@ class TestProviderAccountRoutes:
         from langflow.api.v1.deployments import create_provider_account
 
         mapper = MagicMock()
-        mapper.resolve_verify_credentials.return_value = MagicMock()
-        mapper.resolve_credential_fields.return_value = {"api_key": "api-key"}  # pragma: allowlist secret
-        mapper.resolve_provider_tenant_id.return_value = "tenant-1"
+        mapper.resolve_verify_credentials_for_create.return_value = MagicMock()
+        mapper.resolve_provider_account_create.return_value = MagicMock()
         mock_get_mapper.return_value = mapper
 
         adapter = AsyncMock()
@@ -983,8 +1328,10 @@ class TestProviderAccountRoutes:
         payload = DeploymentProviderAccountCreateRequest(
             name="prod",
             provider_key=DeploymentProviderKey.WATSONX_ORCHESTRATE,
-            url="https://api.us-south.wxo.cloud.ibm.com/instances/tenant-1",
-            provider_data={"api_key": "api-key"},  # pragma: allowlist secret
+            provider_data={
+                "url": "https://api.us-south.wxo.cloud.ibm.com/instances/tenant-1",
+                "api_key": "api-key",  # pragma: allowlist secret
+            },
         )
 
         with pytest.raises(HTTPException) as exc_info:
@@ -1034,6 +1381,87 @@ class TestProviderAccountRoutes:
 
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail == "Provider account is already tracked by user."
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.update_provider_account_row", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_update_provider_account_raw_guard_exception_propagates(
+        self,
+        mock_get_provider_account,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_update_provider_account,
+    ):
+        """PATCH preserves raw guard-shaped DB exceptions without rewriting them."""
+        from langflow.api.v1.deployments import update_provider_account
+
+        existing_account = _fake_provider_account()
+        mock_get_provider_account.return_value = existing_account
+
+        mapper = MagicMock()
+        mapper.resolve_verify_credentials_for_update.return_value = None
+        mapper.resolve_provider_account_update.return_value = {"provider_data": {"tenant_id": "tenant-renamed"}}
+        mock_get_mapper.return_value = mapper
+        mock_resolve_adapter.return_value = AsyncMock()
+        mock_update_provider_account.side_effect = Exception(
+            "DEPLOYMENT_GUARD:DEPLOYMENT_PROVIDER_ACCOUNT_IDENTITY_UPDATE:"
+            "Cannot modify provider key, provider tenant id, or provider URL "
+            "on an existing deployment provider account. "
+            "Re-create the account instead."
+        )
+
+        with pytest.raises(
+            Exception,
+            match="DEPLOYMENT_GUARD:DEPLOYMENT_PROVIDER_ACCOUNT_IDENTITY_UPDATE",
+        ):
+            await update_provider_account(
+                provider_id=existing_account.id,
+                session=AsyncMock(),
+                payload=DeploymentProviderAccountUpdateRequest(provider_data={"tenant_id": "tenant-renamed"}),
+                current_user=_fake_user(),
+            )
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.update_provider_account_row", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_update_provider_account_propagates_deployment_guard_error_instance(
+        self,
+        mock_get_provider_account,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_update_provider_account,
+    ):
+        """PATCH preserves ORM-raised DeploymentGuardError exceptions."""
+        from langflow.api.v1.deployments import update_provider_account
+
+        existing_account = _fake_provider_account()
+        mock_get_provider_account.return_value = existing_account
+
+        mapper = MagicMock()
+        mapper.resolve_verify_credentials_for_update.return_value = None
+        mapper.resolve_provider_account_update.return_value = {"provider_data": {"tenant_id": "tenant-renamed"}}
+        mock_get_mapper.return_value = mapper
+        mock_resolve_adapter.return_value = AsyncMock()
+        mock_update_provider_account.side_effect = DeploymentGuardError(
+            code="DEPLOYMENT_PROVIDER_ACCOUNT_IDENTITY_UPDATE",
+            technical_detail="Cannot modify provider key, provider tenant id, or provider URL.",
+            detail="Cannot modify provider key, provider tenant id, or provider URL.",
+        )
+
+        with pytest.raises(
+            DeploymentGuardError,
+            match="Cannot modify provider key, provider tenant id, or provider URL",
+        ):
+            await update_provider_account(
+                provider_id=existing_account.id,
+                session=AsyncMock(),
+                payload=DeploymentProviderAccountUpdateRequest(provider_data={"tenant_id": "tenant-renamed"}),
+                current_user=_fake_user(),
+            )
 
     @pytest.mark.asyncio
     @patch(f"{ROUTES_MODULE}.delete_provider_account_row", new_callable=AsyncMock)
@@ -1105,6 +1533,141 @@ class TestProviderAccountRoutes:
         assert response.status_code == 204
         mock_count_deployments.assert_awaited_once()
         mock_list_synced.assert_awaited_once()
+        mock_delete_provider_account.assert_awaited_once_with(
+            session,
+            provider_account=existing_account,
+        )
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.delete_provider_account_row", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.list_deployments_synced", new_callable=AsyncMock, return_value=([], 0))
+    @patch(f"{ROUTES_MODULE}.count_deployments_by_provider", new_callable=AsyncMock, return_value=1)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_delete_provider_account_sets_deployment_provider_scope_for_reconciliation(
+        self,
+        mock_get_provider_account,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_count_deployments,  # noqa: ARG002
+        mock_list_synced,
+        mock_delete_provider_account,  # noqa: ARG002
+    ):
+        """Reconciliation must run inside ``deployment_provider_scope`` so adapters can resolve credentials.
+
+        Regression test: without the scope, the WxO adapter raises
+        ``CredentialResolutionError("Deployment account context is not available...")``
+        with status 401, the reconciliation is silently dropped, and the stale local
+        count blocks every provider-account delete with a 409.
+        """
+        from langflow.api.v1.deployments import delete_provider_account
+        from langflow.services.adapters.deployment.context import DeploymentProviderIDContext
+
+        existing_account = _fake_provider_account()
+        mock_get_provider_account.return_value = existing_account
+        mock_get_mapper.return_value = MagicMock()
+        mock_resolve_adapter.return_value = AsyncMock()
+
+        observed_provider_ids: list[object] = []
+
+        async def capture_scope(*_args, **_kwargs):
+            current = DeploymentProviderIDContext.get_current()
+            observed_provider_ids.append(None if current is None else current.provider_id)
+            return ([], 0)
+
+        mock_list_synced.side_effect = capture_scope
+
+        response = await delete_provider_account(
+            provider_id=existing_account.id,
+            session=AsyncMock(),
+            current_user=_fake_user(),
+        )
+
+        assert response.status_code == 204
+        assert observed_provider_ids == [existing_account.id], (
+            "list_deployments_synced must run inside deployment_provider_scope(provider_account.id) "
+            "so the adapter can resolve credentials from DeploymentProviderIDContext."
+        )
+        # And the scope must not leak after the handler returns.
+        assert DeploymentProviderIDContext.get_current() is None
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.delete_provider_account_row", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.list_deployments_synced", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.count_deployments_by_provider", new_callable=AsyncMock, return_value=1)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_delete_provider_account_falls_back_to_local_count_when_reconciliation_raises(
+        self,
+        mock_get_provider_account,
+        mock_get_mapper,
+        mock_resolve_adapter,
+        mock_count_deployments,
+        mock_list_synced,
+        mock_delete_provider_account,
+    ):
+        """If reconciliation fails (e.g. adapter credential error), fall back to the local count.
+
+        The handler must surface the safe 409 (rather than crash) and must NOT delete the
+        provider account row while local deployments are still tracked.
+        """
+        from langflow.api.v1.deployments import delete_provider_account
+        from lfx.services.adapters.deployment.exceptions import CredentialResolutionError
+
+        existing_account = _fake_provider_account()
+        mock_get_provider_account.return_value = existing_account
+        mock_get_mapper.return_value = MagicMock()
+        mock_resolve_adapter.return_value = AsyncMock()
+        mock_list_synced.side_effect = CredentialResolutionError(
+            message="Deployment account context is not available for adapter resolution."
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_provider_account(
+                provider_id=existing_account.id,
+                session=AsyncMock(),
+                current_user=_fake_user(),
+            )
+
+        assert exc_info.value.status_code == 409
+        mock_count_deployments.assert_awaited_once()
+        mock_list_synced.assert_awaited_once()
+        mock_delete_provider_account.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.delete_provider_account_row", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.list_deployments_synced", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.count_deployments_by_provider", new_callable=AsyncMock, return_value=0)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    async def test_delete_provider_account_skips_reconciliation_when_no_local_deployments(
+        self,
+        mock_get_provider_account,
+        mock_get_mapper,  # noqa: ARG002
+        mock_resolve_adapter,  # noqa: ARG002
+        mock_count_deployments,
+        mock_list_synced,
+        mock_delete_provider_account,
+    ):
+        """When the local count is 0 we must not hit the provider; just delete the row."""
+        from langflow.api.v1.deployments import delete_provider_account
+
+        existing_account = _fake_provider_account()
+        mock_get_provider_account.return_value = existing_account
+        session = AsyncMock()
+
+        response = await delete_provider_account(
+            provider_id=existing_account.id,
+            session=session,
+            current_user=_fake_user(),
+        )
+
+        assert response.status_code == 204
+        mock_count_deployments.assert_awaited_once()
+        mock_list_synced.assert_not_awaited()
         mock_delete_provider_account.assert_awaited_once_with(
             session,
             provider_account=existing_account,
@@ -1549,6 +2112,14 @@ class TestGetDeploymentSync:
         from langflow.api.v1.deployments import get_deployment
         from langflow.api.v1.mappers.deployments.base import BaseDeploymentMapper
 
+        class _MapperForGet(BaseDeploymentMapper):
+            def shape_deployment_get_data(self, provider_data):
+                if provider_data is None:
+                    return None
+                sanitized_provider_data = dict(provider_data)
+                sanitized_provider_data.pop("tool_ids", None)
+                return sanitized_provider_data or None
+
         created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
         updated_at = datetime(2026, 1, 3, 4, 5, 6, tzinfo=timezone.utc)
         dep_row = _fake_deployment_row(
@@ -1569,10 +2140,11 @@ class TestGetDeploymentSync:
         provider_deployment.model_dump.return_value = {
             "provider_data": {
                 "llm": "virtual-model/bedrock/openai.gpt-oss-120b-1:0",
+                "tool_ids": ["tool-1", "tool-2"],
             }
         }
         adapter.get.return_value = provider_deployment
-        mock_resolve.return_value = (dep_row, adapter, BaseDeploymentMapper(), "watsonx-orchestrate")
+        mock_resolve.return_value = (dep_row, adapter, _MapperForGet(), "watsonx-orchestrate")
 
         session = AsyncMock()
         result = await get_deployment(deployment_id=dep_row.id, session=session, current_user=_fake_user())
@@ -1583,32 +2155,25 @@ class TestGetDeploymentSync:
         assert result.type == "agent"
         assert result.created_at == created_at
         assert result.updated_at == updated_at
+        assert "tool_ids" not in result.provider_data
         assert result.provider_data == {"llm": "virtual-model/bedrock/openai.gpt-oss-120b-1:0"}
 
     @pytest.mark.asyncio
-    @patch(f"{ROUTES_MODULE}.sync_attachment_snapshot_ids", new_callable=AsyncMock)
-    @patch(f"{ROUTES_MODULE}.fetch_provider_snapshot_keys", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.delete_unbound_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.list_deployment_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.resolve_adapter_mapper_from_deployment", new_callable=AsyncMock)
     async def test_snapshot_sync_corrects_attached_count(
         self,
         mock_resolve,
         mock_list_att,
-        mock_fetch_snap,
-        mock_sync_snap,
+        mock_delete_unbound,
     ):
-        """Snapshot-level sync corrects the attached_count in the response."""
+        """Binding-aware sync corrects attached_count in the response."""
         from langflow.api.v1.deployments import get_deployment
-
-        class _SnapshotMapper:
-            @staticmethod
-            def util_snapshot_ids_to_verify(attachments):
-                return [
-                    attachment.provider_snapshot_id for attachment in attachments if attachment.provider_snapshot_id
-                ]
 
         dep_row = _fake_deployment_row()
         adapter = AsyncMock()
+        mapper = MagicMock()
         provider_deployment = MagicMock()
         provider_deployment.name = "deployed-agent"
         provider_deployment.description = "desc"
@@ -1617,45 +2182,38 @@ class TestGetDeploymentSync:
         provider_deployment.updated_at = None
         provider_deployment.model_dump.return_value = {}
         adapter.get.return_value = provider_deployment
-        mock_resolve.return_value = (dep_row, adapter, _SnapshotMapper(), "watsonx-orchestrate")
+        mapper.extract_snapshot_bindings_for_get.return_value = [
+            ProviderSnapshotBinding(resource_key=dep_row.resource_key, snapshot_id="snap-1")
+        ]
+        mapper.shape_deployment_get_data.return_value = None
+        mock_resolve.return_value = (dep_row, adapter, mapper, "watsonx-orchestrate")
 
         att_good = _fake_attachment(provider_snapshot_id="snap-1")
-        att_stale = _fake_attachment(provider_snapshot_id="snap-stale")
-        mock_list_att.return_value = [att_good, att_stale]
-        mock_fetch_snap.return_value = {"snap-1"}
-        mock_sync_snap.return_value = {dep_row.id: 1}
+        mock_list_att.return_value = [att_good]
 
         session = AsyncMock()
+        session.begin_nested = MagicMock(return_value=_AsyncNoopSavepoint())
         result = await get_deployment(deployment_id=dep_row.id, session=session, current_user=_fake_user())
 
         assert result.attached_count == 1
-        mock_fetch_snap.assert_awaited_once()
-        mock_sync_snap.assert_awaited_once()
+        mock_delete_unbound.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @patch(f"{ROUTES_MODULE}.sync_attachment_snapshot_ids", new_callable=AsyncMock)
-    @patch(f"{ROUTES_MODULE}.fetch_provider_snapshot_keys", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.delete_unbound_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.list_deployment_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.resolve_adapter_mapper_from_deployment", new_callable=AsyncMock)
-    async def test_no_snapshot_sync_when_no_snapshot_ids(
+    async def test_unsupported_provider_falls_back_to_unverified_count(
         self,
         mock_resolve,
         mock_list_att,
-        mock_fetch_snap,
-        mock_sync_snap,
+        mock_delete_unbound,
     ):
-        """When no attachments have provider_snapshot_id, snapshot sync is skipped."""
+        """NotImplemented mapper sync falls back to unverified count."""
         from langflow.api.v1.deployments import get_deployment
-
-        class _SnapshotMapper:
-            @staticmethod
-            def util_snapshot_ids_to_verify(attachments):
-                return [
-                    attachment.provider_snapshot_id for attachment in attachments if attachment.provider_snapshot_id
-                ]
 
         dep_row = _fake_deployment_row()
         adapter = AsyncMock()
+        mapper = MagicMock()
         provider_deployment = MagicMock()
         provider_deployment.name = "deployed-agent"
         provider_deployment.description = "desc"
@@ -1664,40 +2222,34 @@ class TestGetDeploymentSync:
         provider_deployment.updated_at = None
         provider_deployment.model_dump.return_value = {}
         adapter.get.return_value = provider_deployment
-        mock_resolve.return_value = (dep_row, adapter, _SnapshotMapper(), "watsonx-orchestrate")
+        mapper.extract_snapshot_bindings_for_get.side_effect = NotImplementedError("not supported")
+        mapper.shape_deployment_get_data.return_value = None
+        mock_resolve.return_value = (dep_row, adapter, mapper, "watsonx-orchestrate")
         mock_list_att.return_value = [_fake_attachment(provider_snapshot_id=None)]
 
         session = AsyncMock()
         result = await get_deployment(deployment_id=dep_row.id, session=session, current_user=_fake_user())
 
         assert result.attached_count == 1
-        mock_fetch_snap.assert_not_awaited()
-        mock_sync_snap.assert_not_awaited()
+        session.rollback.assert_not_awaited()
+        mock_delete_unbound.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @patch(f"{ROUTES_MODULE}.sync_attachment_snapshot_ids", new_callable=AsyncMock)
-    @patch(f"{ROUTES_MODULE}.fetch_provider_snapshot_keys", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.delete_unbound_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.list_deployment_attachments", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.resolve_adapter_mapper_from_deployment", new_callable=AsyncMock)
-    async def test_snapshot_sync_error_falls_back_to_unverified_count(
+    async def test_binding_aware_sync_error_falls_back_to_unverified_count(
         self,
         mock_resolve,
         mock_list_att,
-        mock_fetch_snap,
-        mock_sync_snap,
+        mock_delete_unbound,
     ):
-        """When snapshot-level sync raises, the response uses unverified attachment count."""
+        """When binding-aware sync raises, response uses unverified attachment count."""
         from langflow.api.v1.deployments import get_deployment
-
-        class _SnapshotMapper:
-            @staticmethod
-            def util_snapshot_ids_to_verify(attachments):
-                return [
-                    attachment.provider_snapshot_id for attachment in attachments if attachment.provider_snapshot_id
-                ]
 
         dep_row = _fake_deployment_row()
         adapter = AsyncMock()
+        mapper = MagicMock()
         provider_deployment = MagicMock()
         provider_deployment.name = "deployed-agent"
         provider_deployment.description = "desc"
@@ -1706,18 +2258,62 @@ class TestGetDeploymentSync:
         provider_deployment.updated_at = None
         provider_deployment.model_dump.return_value = {}
         adapter.get.return_value = provider_deployment
-        mock_resolve.return_value = (dep_row, adapter, _SnapshotMapper(), "watsonx-orchestrate")
+        mapper.extract_snapshot_bindings_for_get.return_value = [
+            ProviderSnapshotBinding(resource_key=dep_row.resource_key, snapshot_id="snap-1")
+        ]
+        mapper.shape_deployment_get_data.return_value = None
+        mock_resolve.return_value = (dep_row, adapter, mapper, "watsonx-orchestrate")
 
         att1 = _fake_attachment(provider_snapshot_id="snap-1")
         att2 = _fake_attachment(provider_snapshot_id="snap-2")
         mock_list_att.return_value = [att1, att2]
-        mock_fetch_snap.side_effect = RuntimeError("provider down")
+        mock_delete_unbound.side_effect = RuntimeError("provider down")
 
         session = AsyncMock()
+        session.begin_nested = MagicMock(return_value=_AsyncNoopSavepoint())
         result = await get_deployment(deployment_id=dep_row.id, session=session, current_user=_fake_user())
 
         assert result.attached_count == 2
-        mock_sync_snap.assert_not_awaited()
+        session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{ROUTES_MODULE}.delete_unbound_attachments", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.list_deployment_attachments", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_adapter_mapper_from_deployment", new_callable=AsyncMock)
+    async def test_binding_aware_sync_prunes_detached_attachments(
+        self,
+        mock_resolve,
+        mock_list_att,
+        mock_delete_unbound,
+    ):
+        """Binding-aware sync sends authoritative bindings and returns corrected count."""
+        from langflow.api.v1.deployments import get_deployment
+
+        dep_row = _fake_deployment_row(resource_key="agent-rk-1")
+        adapter = AsyncMock()
+        mapper = MagicMock()
+        provider_deployment = MagicMock()
+        provider_deployment.model_dump.return_value = {}
+        adapter.get.return_value = provider_deployment
+        mapper.extract_snapshot_bindings_for_get.return_value = [
+            ProviderSnapshotBinding(resource_key="agent-rk-1", snapshot_id="snap-1")
+        ]
+        mapper.shape_deployment_get_data.return_value = None
+        mock_resolve.return_value = (dep_row, adapter, mapper, "watsonx-orchestrate")
+        mock_list_att.return_value = [_fake_attachment(provider_snapshot_id="snap-1")]
+
+        session = AsyncMock()
+        session.begin_nested = MagicMock(return_value=_AsyncNoopSavepoint())
+        result = await get_deployment(deployment_id=dep_row.id, session=session, current_user=_fake_user())
+
+        assert result.attached_count == 1
+        mock_delete_unbound.assert_awaited_once_with(
+            db=session,
+            user_id=ANY,
+            provider_account_id=dep_row.deployment_provider_account_id,
+            deployment_ids=[dep_row.id],
+            bindings=[ProviderSnapshotBinding(resource_key="agent-rk-1", snapshot_id="snap-1")],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2308,17 +2904,59 @@ class TestHandleAdapterErrors:
         deployment_mapper.format_conflict_detail.return_value = "friendly detail"
 
         with pytest.raises(HTTPException) as exc_info, handle_adapter_errors(mapper=deployment_mapper):
-            raise DeploymentConflictError(message="raw provider conflict")
+            raise ResourceConflictError(message="raw provider conflict")
 
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail == "friendly detail"
-        deployment_mapper.format_conflict_detail.assert_called_once_with("raw provider conflict")
+        deployment_mapper.format_conflict_detail.assert_called_once_with(
+            "raw provider conflict",
+            resource=None,
+            resource_name=None,
+        )
+
+    def test_maps_conflict_passes_structured_resource_to_mapper_formatter(self):
+        from langflow.api.v1.mappers.deployments.helpers import handle_adapter_errors
+
+        deployment_mapper = MagicMock()
+        deployment_mapper.format_conflict_detail.return_value = "friendly detail"
+
+        with pytest.raises(HTTPException) as exc_info, handle_adapter_errors(mapper=deployment_mapper):
+            raise ResourceConflictError(message="raw provider conflict", resource="tool")
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == "friendly detail"
+        deployment_mapper.format_conflict_detail.assert_called_once_with(
+            "raw provider conflict",
+            resource="tool",
+            resource_name=None,
+        )
+
+    def test_maps_conflict_passes_structured_resource_name_to_mapper_formatter(self):
+        from langflow.api.v1.mappers.deployments.helpers import handle_adapter_errors
+
+        deployment_mapper = MagicMock()
+        deployment_mapper.format_conflict_detail.return_value = "friendly detail"
+
+        with pytest.raises(HTTPException) as exc_info, handle_adapter_errors(mapper=deployment_mapper):
+            raise ResourceConflictError(
+                message="raw provider conflict",
+                resource="tool",
+                resource_name="Simple_Agent",
+            )
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == "friendly detail"
+        deployment_mapper.format_conflict_detail.assert_called_once_with(
+            "raw provider conflict",
+            resource="tool",
+            resource_name="Simple_Agent",
+        )
 
     def test_maps_conflict_without_mapper_passthrough(self):
         from langflow.api.v1.mappers.deployments.helpers import handle_adapter_errors
 
         with pytest.raises(HTTPException) as exc_info, handle_adapter_errors():
-            raise DeploymentConflictError(message="raw provider conflict")
+            raise ResourceConflictError(message="raw provider conflict")
 
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail == "raw provider conflict"

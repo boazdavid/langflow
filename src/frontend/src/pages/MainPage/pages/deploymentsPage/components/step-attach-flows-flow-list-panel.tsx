@@ -42,61 +42,70 @@ export const FlowListPanel = memo(function FlowListPanel({
             .map((cid) => connections.find((c) => c.id === cid)?.name)
             .filter(Boolean);
           return (
-            <button
+            <div
               key={flow.id}
-              type="button"
+              role="button"
+              tabIndex={0}
               data-testid={`flow-item-${flow.id}`}
               onClick={() => onSelectFlow(flow.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelectFlow(flow.id);
+                }
+              }}
               className={cn(
-                "flex w-full items-center gap-3 rounded-lg p-3 text-left transition-colors",
+                "flex w-full cursor-pointer items-center gap-3 rounded-lg p-3 text-left transition-colors",
                 isRemoved && "opacity-50",
                 selectedFlowId === flow.id ? "bg-muted" : "hover:bg-muted/60",
               )}
             >
-              <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted">
-                <ForwardedIconComponent
-                  name={flow.icon ?? "Workflow"}
-                  className="h-4 w-4 text-muted-foreground"
-                />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="truncate text-sm font-semibold">
-                    {flow.name}
-                  </span>
-                  {versionLabel && !isRemoved && (
-                    <Badge
-                      variant="secondaryStatic"
-                      size="tag"
-                      className="bg-accent-purple-muted text-accent-purple-muted-foreground"
-                    >
-                      {versionLabel}
-                    </Badge>
-                  )}
-                  {attached && !isRemoved && (
-                    <Badge
-                      variant="secondaryStatic"
-                      size="tag"
-                      className="bg-accent-blue-muted text-accent-blue-muted-foreground"
-                    >
-                      ATTACHED
-                    </Badge>
-                  )}
-                  {isRemoved && (
-                    <Badge
-                      variant="secondaryStatic"
-                      size="tag"
-                      className="bg-destructive/10 text-destructive"
-                    >
-                      REMOVED
-                    </Badge>
+              <div className="flex min-w-0 flex-1 items-center gap-3 text-left">
+                <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted">
+                  <ForwardedIconComponent
+                    name={flow.icon ?? "Workflow"}
+                    className="h-4 w-4 text-muted-foreground"
+                  />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-sm font-semibold">
+                      {flow.name}
+                    </span>
+                    {versionLabel && !isRemoved && (
+                      <Badge
+                        variant="secondaryStatic"
+                        size="tag"
+                        className="bg-accent-purple-muted text-accent-purple-muted-foreground"
+                      >
+                        {versionLabel}
+                      </Badge>
+                    )}
+                    {attached && !isRemoved && (
+                      <Badge
+                        variant="secondaryStatic"
+                        size="tag"
+                        className="bg-accent-blue-muted text-accent-blue-muted-foreground"
+                      >
+                        ATTACHED
+                      </Badge>
+                    )}
+                    {isRemoved && (
+                      <Badge
+                        variant="secondaryStatic"
+                        size="tag"
+                        className="bg-destructive/10 text-destructive"
+                      >
+                        REMOVED
+                      </Badge>
+                    )}
+                  </div>
+                  {connectionNames.length > 0 && !isRemoved && (
+                    <p className="truncate text-xs text-muted-foreground">
+                      {connectionNames.join(", ")}
+                    </p>
                   )}
                 </div>
-                {connectionNames.length > 0 && !isRemoved && (
-                  <p className="truncate text-xs text-muted-foreground">
-                    {connectionNames.join(", ")}
-                  </p>
-                )}
               </div>
               {attached && !isRemoved && onRemoveFlow && (
                 <button
@@ -118,10 +127,7 @@ export const FlowListPanel = memo(function FlowListPanel({
                   data-testid={`undo-remove-flow-${flow.id}`}
                   className="flex-shrink-0 rounded p-1 text-muted-foreground hover:bg-accent-blue-muted hover:text-accent-blue-muted-foreground"
                   title="Undo detach"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onUndoRemoveFlow(flow.id);
-                  }}
+                  onClick={() => onUndoRemoveFlow(flow.id)}
                 >
                   <ForwardedIconComponent
                     name="Undo2"
@@ -129,7 +135,7 @@ export const FlowListPanel = memo(function FlowListPanel({
                   />
                 </button>
               )}
-            </button>
+            </div>
           );
         })}
       </div>

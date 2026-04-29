@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Annotated
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import orjson
 import sqlalchemy as sa
@@ -34,6 +34,7 @@ from lfx.utils.flow_validation import (
 from sqlmodel import select
 
 from langflow.api.utils import CurrentActiveUser, DbSession, extract_global_variables_from_headers, parse_value
+from langflow.api.v1.files import get_flow
 from langflow.api.v1.schemas import (
     ConfigResponse,
     CustomComponentRequest,
@@ -411,6 +412,33 @@ async def check_flow_user_permission(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to run this flow")
 
 
+async def get_flow_for_api_key_user(
+    flow_id_or_name: str,
+    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+) -> FlowRead:
+    """Auth-aware wrapper around ``get_flow_by_id_or_endpoint_name`` for API-key routes.
+
+    Using the raw helper as a FastAPI ``Depends`` exposed ``user_id`` as a
+    plain query parameter that no real caller sets, so flow lookups on the
+    ``/run*`` routes bypassed user scoping entirely and relied on
+    ``check_flow_user_permission`` later in the handler for a 403.  That gave
+    attackers a 403-vs-404 existence oracle on flow UUIDs.  This wrapper
+    pulls the authenticated user from ``api_key_security`` and passes it to
+    the helper, so cross-user access fails closed with 404 at the helper
+    layer.  ``check_flow_user_permission`` is kept in the handler chain as
+    defense in depth.
+    """
+    return await get_flow_by_id_or_endpoint_name(flow_id_or_name, api_key_user.id)
+
+
+async def get_flow_for_current_user(
+    flow_id_or_name: str,
+    current_user: CurrentActiveUser,
+) -> FlowRead:
+    """Session-auth variant of :func:`get_flow_for_api_key_user`."""
+    return await get_flow_by_id_or_endpoint_name(flow_id_or_name, current_user.id)
+
+
 async def _run_flow_internal(
     *,
     background_tasks: BackgroundTasks,
@@ -555,7 +583,7 @@ async def _run_flow_internal(
 async def simplified_run_flow(
     *,
     background_tasks: BackgroundTasks,
-    flow: Annotated[FlowRead, Depends(get_flow_by_id_or_endpoint_name)],
+    flow: Annotated[FlowRead, Depends(get_flow_for_api_key_user)],
     input_request: SimplifiedAPIRequest | None = None,
     stream: bool = False,
     api_key_user: Annotated[UserRead, Depends(api_key_security)],
@@ -615,7 +643,7 @@ async def simplified_run_flow(
 async def simplified_run_flow_session(
     *,
     background_tasks: BackgroundTasks,
-    flow: Annotated[FlowRead, Depends(get_flow_by_id_or_endpoint_name)],
+    flow: Annotated[FlowRead, Depends(get_flow_for_current_user)],
     input_request: SimplifiedAPIRequest | None = None,
     stream: bool = False,
     api_key_user: CurrentActiveUser,
@@ -681,6 +709,7 @@ async def simplified_run_flow_session(
 async def webhook_events_stream(
     flow_id_or_name: str,  # noqa: ARG001 - Used by get_flow_by_id_or_endpoint_name dependency
     flow: Annotated[Flow, Depends(get_flow_by_id_or_endpoint_name)],
+    user: Annotated[User | UserRead, Depends(get_current_user_for_sse)],
     request: Request,
 ):
     """Server-Sent Events (SSE) endpoint for real-time webhook build updates.
@@ -691,9 +720,6 @@ async def webhook_events_stream(
     Authentication: Requires user to be logged in (via cookie) or provide API key.
     The user must own the flow to subscribe to its events.
     """
-    # Authenticate user via cookie or API key
-    user = await get_current_user_for_sse(request)
-
     # Verify user owns the flow
     if str(flow.user_id) != str(user.id):
         raise HTTPException(
@@ -827,7 +853,7 @@ async def webhook_run_flow(
 async def experimental_run_flow(
     *,
     session: DbSession,
-    flow: Annotated[Flow, Depends(get_flow_by_id_or_endpoint_name)],
+    flow: Annotated[Flow, Depends(get_flow_for_api_key_user)],
     inputs: list[InputValueRequest] | None = None,
     outputs: list[str] | None = None,
     tweaks: Annotated[Tweaks | None, Body(embed=True)] = None,
@@ -989,14 +1015,31 @@ async def get_task_status(_task_id: str) -> TaskStatusResponse:
 )
 async def create_upload_file(
     file: UploadFile,
-    flow_id: UUID,
+    flow: Annotated[Flow, Depends(get_flow)],
+    settings_service: Annotated[SettingsService, Depends(get_settings_service)],
 ) -> UploadFileResponse:
     """Upload a file for a specific flow (Deprecated).
 
     This endpoint is deprecated and will be removed in a future version.
+    Authorization is handled by the ``get_flow`` dependency, which requires an
+    authenticated user and verifies flow ownership.  Mirrors the
+    ``max_file_size_upload`` guard on the non-deprecated twin at
+    ``/api/v1/files/upload/{flow_id}`` so authenticated callers can't fill
+    disk through this route either.
     """
     try:
-        flow_id_str = str(flow_id)
+        max_file_size_upload = settings_service.settings.max_file_size_upload
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if file.size is not None and file.size > max_file_size_upload * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size is larger than the maximum file size {max_file_size_upload}MB.",
+        )
+
+    try:
+        flow_id_str = str(flow.id)
         file_path = await asyncio.to_thread(save_uploaded_file, file, folder_name=flow_id_str)
 
         return UploadFileResponse(
@@ -1110,7 +1153,21 @@ async def custom_component_update(
                 if isinstance(field_dict, dict) and field_dict.get("load_from_db") and field_dict.get("value")
             ]
             if isinstance(cc_instance, Component):
-                params = await update_params_with_load_from_db_fields(cc_instance, params, load_from_db_fields)
+                # ``fallback_to_env_vars=True`` so a missing variable (e.g. an
+                # imported flow referencing ``ANTHROPIC_API_KEY`` when the
+                # current user hasn't configured one) degrades to ``None``
+                # instead of raising.  This endpoint only refreshes form
+                # metadata — it does not execute the component — so we don't
+                # need the real credential here.  The runtime build path still
+                # calls ``update_params_with_load_from_db_fields`` with its own
+                # fallback setting, so this change doesn't relax execution-time
+                # requirements.
+                params = await update_params_with_load_from_db_fields(
+                    cc_instance,
+                    params,
+                    load_from_db_fields,
+                    fallback_to_env_vars=True,
+                )
                 cc_instance.set_attributes(params)
         updated_build_config = code_request.get_template()
         await update_component_build_config(
