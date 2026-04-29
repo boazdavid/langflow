@@ -11,6 +11,7 @@ from toolguard.buildtime import (
     generate_guard_specs,
     generate_guards_code,
 )
+from toolguard.buildtime.llm import LangchainModelWrapper
 from toolguard.extra.langchain_to_oas import langchain_tools_to_openapi
 from toolguard.runtime import load_toolguards, load_toolguards_from_memory
 from toolguard.runtime.runtime import RESULTS_FILENAME
@@ -23,7 +24,6 @@ from lfx.base.models.unified_models import (
 )
 from lfx.components.models_and_agents.policies.guard_sync_utils import sync_generated_guard_code_inputs
 from lfx.components.models_and_agents.policies.guarded_tool import GuardedTool
-from lfx.components.models_and_agents.policies.llm_wrapper import LangchainModelWrapper
 from lfx.components.models_and_agents.policies.module_utils import unload_module
 from lfx.field_typing import LanguageModel, Tool
 from lfx.io import (
